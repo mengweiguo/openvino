@@ -293,6 +293,98 @@ public:
     }
 };
 
+std::string combine_key_value_name(std::string prefix,
+                                     std::string layer_id,
+                                     std::string key_or_value) {
+    return prefix + "." + layer_id + "." + key_or_value;
+}
+
+void set_node_name(std::shared_ptr<ov::Node> result, const std::string& name) {
+    result->set_friendly_name(name);
+    result->get_output_tensor(0).set_names({name});
+}
+
+class AddKVCacheNodes : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::AddKVCacheNodes");
+    explicit AddKVCacheNodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
+        const auto unsqueeze_axes = opp::wrap_type<ov::op::v0::Constant>();
+        const auto transpose_order = opp::wrap_type<ov::op::v0::Constant>();
+        const std::regex layer_id_convention =
+            std::regex(R"(layers\.(\d+)\.self_attn)");
+
+        auto k_add = opp::wrap_type<ov::op::v1::Add>({opp::any_input(), opp::any_input()});
+        auto k_unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({k_add, unsqueeze_axes});
+        auto k_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({k_unsqueeze, opp::any_input()});
+        auto k_reshape = opp::wrap_type<ov::op::v1::Reshape>({k_broadcast, opp::any_input()});
+
+        auto v_transpose = opp::wrap_type<ov::op::v1::Transpose>({opp::any_input(), transpose_order});
+        auto v_unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({v_transpose, unsqueeze_axes});
+        auto v_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({v_unsqueeze, opp::any_input()});
+        auto v_reshape = opp::wrap_type<ov::op::v1::Reshape>({v_broadcast, opp::any_input()});
+
+        auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>({opp::any_input(), k_reshape, v_reshape, opp::any_input(), opp::any_input()});
+
+        ov::matcher_pass_callback callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& pattern_to_output = m.get_pattern_value_map();
+            auto sdpa_node = pattern_to_output.at(sdpa).get_node_shared_ptr();
+            auto k_add_node = pattern_to_output.at(k_add).get_node_shared_ptr();
+            auto k_unsqueeze_node = pattern_to_output.at(k_unsqueeze).get_node_shared_ptr();
+            auto v_transpose_node = pattern_to_output.at(v_transpose).get_node_shared_ptr();
+            auto v_unsqueeze_node = pattern_to_output.at(v_unsqueeze).get_node_shared_ptr();
+
+            auto k_broadcast_node = pattern_to_output.at(k_broadcast).get_node_shared_ptr();
+            auto v_broadcast_node = pattern_to_output.at(v_broadcast).get_node_shared_ptr();
+
+            std::smatch match;
+            if (std::regex_search(sdpa_node->get_friendly_name(), match, layer_id_convention)) {
+                  LOG_WARN("Extracted value: : " << match[1]);
+                  std::cout << "Extracted value: " << match[1] << std::endl;
+              } else {
+                  std::cout << "No match found." << std::endl;
+                  LOG_WARN("No match found.");
+                  return false;
+            }
+              
+            auto layer_id = std::string(match[1]);
+            auto k_add_out_shape = k_add_node->get_output_partial_shape(0);
+            auto k_add_type = k_add_node->get_output_element_type(0);
+            auto k_cache =
+                std::make_shared<ov::op::v0::Parameter>(k_add_type, k_add_out_shape);
+            set_node_name(k_cache, combine_key_value_name("past_key_values", layer_id, "key"));
+
+            auto k_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{k_cache, k_add_node}, seq_len_dim);
+
+            set_node_name(k_concat, combine_key_value_name("concat", layer_id, "key"));
+
+            k_unsqueeze_node->input(0).replace_source_output(k_concat);
+            auto k_cache_out = std::make_shared<ov::op::v0::Result>(k_add_node);
+            set_node_name(k_cache_out, combine_key_value_name("present", layer_id, "key"));
+
+            auto v_transpose_out_shape = v_transpose_node->get_output_partial_shape(0);
+            auto v_transpose_type = v_transpose_node->get_output_element_type(0);
+            auto v_cache =
+                std::make_shared<ov::op::v0::Parameter>(v_transpose_type, v_transpose_out_shape);
+            set_node_name(v_cache, combine_key_value_name("past_key_values", layer_id, "value"));
+
+            auto v_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{v_cache, v_transpose_node}, seq_len_dim);
+            set_node_name(v_concat, combine_key_value_name("concat", layer_id, "value"));
+
+            v_unsqueeze_node->input(0).replace_source_output(v_concat);
+
+            auto v_cache_out = std::make_shared<ov::op::v0::Result>(v_transpose_node);
+            set_node_name(v_cache_out, combine_key_value_name("present", layer_id, "value"));
+
+            model->add_parameters(ov::ParameterVector{k_cache, v_cache});
+            model->add_results(ov::ResultVector{k_cache_out, v_cache_out});
+            return true;
+        };
+
+        auto m = std::make_shared<ov::pass::pattern::Matcher>(sdpa, "AddKVCacheNodes");
+        register_matcher(m, std::move(callback));
+    }
+};
+
 class AttentionMaskInputPast : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::AttentionMaskInputPast");
@@ -518,6 +610,15 @@ bool ov::npuw::util::optimize_value_tensors(std::shared_ptr<ov::Model> model, bo
 
     // NB: matmul parameters gets transposed, if pass applied
     return ctx.bTransposed;
+}
+
+bool ov::npuw::util::add_kvcache_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
+    ov::pass::GraphRewrite rewr;
+    rewr.add_matcher<AddKVCacheNodes>(model, seq_len_dim);
+    rewr.run_on_model(model);
+
+    ov::pass::Validate().run_on_model(model);
+    return true;
 }
 
 namespace {
