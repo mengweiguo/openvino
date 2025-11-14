@@ -313,14 +313,16 @@ public:
         const std::regex layer_id_convention =
             std::regex(R"(layers\.(\d+)\.self_attn)");
 
+        auto shape_concat = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
+
         auto k_add = opp::wrap_type<ov::op::v1::Add>({opp::any_input(), opp::any_input()});
         auto k_unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({k_add, unsqueeze_axes});
-        auto k_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({k_unsqueeze, opp::any_input()});
+        auto k_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({k_unsqueeze, shape_concat});
         auto k_reshape = opp::wrap_type<ov::op::v1::Reshape>({k_broadcast, opp::any_input()});
 
         auto v_transpose = opp::wrap_type<ov::op::v1::Transpose>({opp::any_input(), transpose_order});
         auto v_unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({v_transpose, unsqueeze_axes});
-        auto v_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({v_unsqueeze, opp::any_input()});
+        auto v_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({v_unsqueeze, shape_concat});
         auto v_reshape = opp::wrap_type<ov::op::v1::Reshape>({v_broadcast, opp::any_input()});
 
         auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>({opp::any_input(), k_reshape, v_reshape, opp::any_input(), opp::any_input()});
@@ -345,7 +347,7 @@ public:
                   LOG_WARN("No match found.");
                   return false;
             }
-              
+
             auto layer_id = std::string(match[1]);
             auto k_add_out_shape = k_add_node->get_output_partial_shape(0);
             auto k_add_type = k_add_node->get_output_element_type(0);
@@ -354,10 +356,10 @@ public:
             set_node_name(k_cache, combine_key_value_name("past_key_values", layer_id, "key"));
 
             auto k_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{k_cache, k_add_node}, seq_len_dim);
-
             set_node_name(k_concat, combine_key_value_name("concat", layer_id, "key"));
 
             k_unsqueeze_node->input(0).replace_source_output(k_concat);
+
             auto k_cache_out = std::make_shared<ov::op::v0::Result>(k_add_node);
             set_node_name(k_cache_out, combine_key_value_name("present", layer_id, "key"));
 
@@ -377,6 +379,28 @@ public:
 
             model->add_parameters(ov::ParameterVector{k_cache, v_cache});
             model->add_results(ov::ResultVector{k_cache_out, v_cache_out});
+
+            // change shape for Broadcast op
+            auto concat_shape_node = k_broadcast_node->input(1).get_source_output().get_node();
+            NPUW_ASSERT(strstr(concat_shape_node->get_type_name(), "Concat") != nullptr);
+
+            auto minus_two = register_new_node(ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {-2}));
+            auto zero_i = register_new_node(ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0}));
+            auto one_i = register_new_node(ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1}));
+
+            auto k_shapeof = register_new_node<ov::op::v3::ShapeOf>(k_add_node, ov::element::i64);
+            auto k_s_len = register_new_node<ov::op::v8::Gather>(k_shapeof, minus_two, zero_i);
+
+            auto k_cache_shapeof = register_new_node<ov::op::v3::ShapeOf>(k_cache, ov::element::i64);
+            auto k_cache_s_len = register_new_node<ov::op::v8::Gather>(k_cache_shapeof, minus_two, zero_i);
+            auto s_len_add = std::make_shared<ov::op::v1::Add>(k_s_len, k_cache_s_len);
+            auto s_len_reshape = std::make_shared<ov::op::v1::Reshape>(s_len_add, one_i, false);
+
+            auto new_shape_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{concat_shape_node->input(0).get_source_output(),
+                concat_shape_node->input(1).get_source_output(), s_len_reshape, concat_shape_node->input(3).get_source_output()}, 0);
+            k_broadcast_node->input(1).replace_source_output(new_shape_concat);
+            v_broadcast_node->input(1).replace_source_output(new_shape_concat);
+
             return true;
         };
 
