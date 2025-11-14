@@ -935,7 +935,6 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
                        const uint32_t lhs_seq_size = 0,
                        const bool is_encoder = false) {
     std::map<std::string, ov::PartialShape> new_shapes;
-    std::cout << "input size: " <<  model->inputs().size() << std::endl;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
         ov::PartialShape new_shape;
@@ -1374,6 +1373,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_cfg.update({{"NPUW_LLM_CACHE_ROPE", "NO"}});
     }
 
+    auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
+    m_is_text_embed = use_text_embed_key.value_or(false).as<bool>() == true;
+
     // NB: PREFILL_HINT is now compatible with the PREFILL_CONFIG section, unlike for
     // the generate model they're not mutually exclusive
     const ::intel_npu::npuw::llm::PrefillHint prefill_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
@@ -1427,13 +1429,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
     KVAxesPosition axes{batch_dim, seq_len_dim};
 
-    bool is_encoder_model = true;
-
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
     LOG_DEBUG("Transform kvcache model from stateful to stateless.");
 
-    if (is_encoder_model) {
+    if (m_is_text_embed) {
         if (m_use_chunk_prefill) {
             ov::npuw::util::add_kvcache_nodes(kvcache_model, seq_len_dim);
         }
@@ -1509,14 +1509,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                       axes,
                       m_max_lora_rank,
                       whisper_lhs_seq_size,
-                      is_encoder_model);
-
-    std::cout << m_prefill_chunk_size << " :: " << m_kvcache_desc.max_prompt_size << std::endl;
-    std::cout << m_kvcache_desc.max_generation_token_len << " :: " << m_kvcache_desc.total_size << std::endl;
-    ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_m_kvcache.xml");
-    ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_m_prefill.xml");
-    LOG_ERROR("models dumped");
-
+                      m_is_text_embed);
 
     LOG_DEBUG("Try parametrize Gemma sliding window mask, if it exists.");
     gemma_transformations(kvcache_model);
@@ -1556,7 +1549,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Check and apply opt layout --- SKIPPED");
     }
 
-    if (!m_use_chunk_prefill && !is_encoder_model) {
+    if (!m_use_chunk_prefill && !m_is_text_embed) {
         NPUW_ASSERT(remove_empty_kv_inputs(prefill_model));
     } else {
         LOG_DEBUG("Don't remove input key/values from prefill model.");
@@ -2106,6 +2099,7 @@ void ov::npuw::LLMCompiledModel::implement_properties() {
                           BIND(npuw::llm::prefill_attn_hint, NPUW_LLM_PREFILL_ATTENTION_HINT, getString),
                           BIND(npuw::llm::generate_attn_hint, NPUW_LLM_GENERATE_ATTENTION_HINT, getString),
                           BIND(npuw::llm::shared_lm_head, NPUW_LLM_SHARED_HEAD, get),
-                          BIND(npuw::whisper::enabled, NPUW_WHISPER, get)});
+                          BIND(npuw::whisper::enabled, NPUW_WHISPER, get),
+                          BIND(npuw::text_embed::enabled, NPUW_TEXT_EMBED, get)});
 #undef BIND
 }

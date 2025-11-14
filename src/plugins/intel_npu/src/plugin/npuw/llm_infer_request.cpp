@@ -912,9 +912,6 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 
 void ov::npuw::LLMInferRequest::infer() {
     const auto& inputs = get_inputs();
-
-    std::cout << "OV:infer" << std::endl;
-
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
     auto attention_mask = get_tensor(ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask).value());
 
@@ -968,11 +965,8 @@ void ov::npuw::LLMInferRequest::infer() {
     // The outcome of two items is that prefill and generate stages
     //    can be safely differentiated by start position id for
     //    both main and draft models.
-
-    std::cout << "OV:infer-1" << std::endl;
     if (input_ids->get_shape()[layer_ids::INPUT_IDS_SEQ_LEN_DIM] > 1 &&
         (position_ids == nullptr || position_ids->data<int64_t>()[0] == m_first_position_id)) {
-        std::cout << "OV:infer-1 infer_prefill" << std::endl;
         infer_prefill(input_ids, attention_mask, position_ids, token_type_ids);
     } else {
         auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
@@ -981,7 +975,6 @@ void ov::npuw::LLMInferRequest::infer() {
         if (kvcache_desc.max_generation_token_len > 1 && position_ids != nullptr) {
             trim_kvcache_for_speculative_decoding(position_ids);
         }
-        std::cout << "OV:infer-1 infer_generate" << std::endl;
         infer_generate(input_ids, attention_mask, position_ids, token_type_ids);
     }
 }

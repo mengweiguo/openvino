@@ -102,6 +102,7 @@ private:
     int32_t m_gemma_sliding_window_size = 0;
 
     bool m_is_whisper = false;
+    bool m_is_text_embed = false;
 };
 
 }  // namespace npuw
