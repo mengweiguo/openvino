@@ -28,6 +28,7 @@ public:
         static constexpr const char* logits = "logits";
         static constexpr const char* token_type_ids = "token_type_ids";
         static constexpr const char* gemma_sliding_mask = "npuw_gemma_sliding_mask";
+        static constexpr const char* last_hidden_state = "last_hidden_state";
     };
 
     struct layer_ids {
