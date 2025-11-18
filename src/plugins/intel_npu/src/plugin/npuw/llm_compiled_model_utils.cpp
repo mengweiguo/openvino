@@ -26,6 +26,218 @@ namespace opp = ov::pass::pattern;
 #endif
 namespace {
 
+// Generate LLM causal mask matrix with shape (seq_len, seq_len + cache_len) using ngraph ops
+// Inputs: input_ids node and attention_mask node from the model
+// The function extracts seq_len from input_ids shape and cache_len from attention_mask shape
+// Considers actual attention_mask values (0 for masked positions, 1 for valid positions)
+// Output: causal mask tensor of shape (seq_len, seq_len + cache_len)
+ov::Output<ov::Node> create_llm_causal_mask_subgraph(const ov::Output<ov::Node>& input_ids,
+                                                       const ov::Output<ov::Node>& attention_mask,
+                                                       ov::element::Type element_type = ov::element::f32) {
+    using namespace ov::op;
+
+    // Constants
+    auto zero_i = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, 0);
+    auto one_i = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, 1);
+    auto minus_one = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, -1);
+    auto zero_f = std::make_shared<v0::Constant>(element_type, ov::Shape{}, 0.0f);
+    auto minus_inf = std::make_shared<v0::Constant>(element_type, ov::Shape{}, -std::numeric_limits<float>::infinity());
+
+    // Extract seq_len from input_ids shape: input_ids has shape [batch, seq_len]
+    auto input_ids_shape = std::make_shared<v3::ShapeOf>(input_ids, ov::element::i64);
+    auto seq_len = std::make_shared<v8::Gather>(input_ids_shape, minus_one, zero_i);  // Get last dimension
+
+    // Extract cache_len from attention_mask shape: attention_mask has shape [batch, cache_len + seq_len]
+    auto attn_mask_shape = std::make_shared<v3::ShapeOf>(attention_mask, ov::element::i64);
+    auto total_seq_len = std::make_shared<v8::Gather>(attn_mask_shape, minus_one, zero_i);  // Get last dimension
+
+    // Calculate cache_len = total_seq_len - seq_len
+    auto cache_len = std::make_shared<v1::Subtract>(total_seq_len, seq_len);
+
+    // Create vertical range [0, 1, 2, ..., seq_len-1] with shape (seq_len, 1)
+    auto vertical_range = std::make_shared<v4::Range>(zero_i, seq_len, one_i, ov::element::i64);
+    auto vertical_range_unsqueeze = std::make_shared<v0::Unsqueeze>(vertical_range, one_i);  // shape: (seq_len, 1)
+
+    // Create horizontal range [0, 1, 2, ..., total_seq_len-1] with shape (1, total_seq_len)
+    auto horizontal_range = std::make_shared<v4::Range>(zero_i, total_seq_len, one_i, ov::element::i64);
+    auto horizontal_range_unsqueeze = std::make_shared<v0::Unsqueeze>(horizontal_range, zero_i);  // shape: (1, total_seq_len)
+
+    // For causal mask with KV cache:
+    // - Cache positions [0, cache_len) are visible to all queries
+    // - New token positions [cache_len, total_seq_len) follow causal pattern
+    // Query i can attend to: cache[0:cache_len] + new_tokens[cache_len:cache_len+i+1]
+    // Which means: positions where (j < cache_len) OR (j <= cache_len + i)
+    // Simplified: j <= cache_len + i (since cache_len + i >= cache_len when i >= 0)
+    //
+    // IMPORTANT: When cache_len is large and seq_len is small, the resulting mask will appear
+    // to have "left part as 0, right part as -inf", which is CORRECT! This means:
+    // - All queries can see the entire cache (left part, all 0s)
+    // - New tokens follow causal pattern (right part shows diagonal -inf pattern)
+    // Example: cache_len=100, seq_len=2, total=102
+    //   Q0: [0...0 (100个cache全可见) | 0  X] (新token: 看T0, 不看T1)
+    //   Q1: [0...0 (100个cache全可见) | 0  0] (新token: 看T0,T1)
+
+    // Calculate the threshold for each query position: cache_len + vertical_range
+    // threshold[i] = cache_len + i means query i can see up to position cache_len+i
+    auto threshold = std::make_shared<v1::Add>(cache_len, vertical_range_unsqueeze);
+
+    // Create causal mask: horizontal_range <= threshold
+    // This allows: all cache + causal pattern for new tokens
+    auto causal_condition = std::make_shared<v1::LessEqual>(horizontal_range_unsqueeze, threshold);
+
+    // Step 2: Process attention_mask
+    // Convert attention_mask to boolean: 1 -> true (valid), 0 -> false (masked)
+    auto attn_mask_bool = std::make_shared<v0::Convert>(attention_mask, ov::element::boolean);
+
+    // Expand attention_mask from [batch, total_seq_len] to [batch, 1, total_seq_len]
+    auto attn_mask_expanded = std::make_shared<v0::Unsqueeze>(attn_mask_bool, one_i);  // shape: (batch, 1, total_seq_len)
+
+    // Step 3: Combine causal mask with attention_mask using LogicalAnd
+    // Expand causal_condition to (1, seq_len, total_seq_len) for broadcasting
+    auto causal_expanded = std::make_shared<v0::Unsqueeze>(causal_condition, zero_i);  // shape: (1, seq_len, total_seq_len)
+
+    // Logical AND: position is valid only if both causal allows AND attention_mask allows
+    // This correctly handles cases like attention_mask=[1,1,1,0,0,0,1,1,1]
+    // where padding positions in the middle should be masked regardless of causal pattern
+    auto combined_condition = std::make_shared<v1::LogicalAnd>(causal_expanded, attn_mask_expanded);
+
+    // Step 4: Convert boolean mask to float mask
+    // True (valid) -> 0.0, False (masked) -> -inf
+    auto combined_mask = std::make_shared<v1::Select>(combined_condition, zero_f, minus_inf);
+
+    return combined_mask;
+}
+
+// Generate Qwen3 LLM mask matrix using ngraph ops
+// Qwen3 uses a 4D attention mask with shape (batch, 1, seq_len, seq_len + cache_len)
+// The mask combines causal attention pattern with input attention_mask values
+// Inputs:
+//   - input_ids: shape [batch, seq_len]
+//   - attention_mask: shape [batch, seq_len + cache_len], values are 0 (masked) or 1 (valid)
+// Output: 4D mask tensor of shape (batch, 1, seq_len, seq_len + cache_len)
+//   - Values are 0.0 for positions that can be attended to
+//   - Values are -inf for masked positions
+ov::Output<ov::Node> create_qwen3_mask_subgraph(const ov::Output<ov::Node>& input_ids,
+                                                 const ov::Output<ov::Node>& attention_mask,
+                                                 ov::element::Type element_type = ov::element::f32) {
+    using namespace ov::op;
+
+    // Constants
+    auto zero_i = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, 0);
+    auto one_i = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, 1);
+    auto two_i = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, 2);
+    auto minus_one = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, -1);
+    auto minus_two = std::make_shared<v0::Constant>(ov::element::i64, ov::Shape{}, -2);
+    auto zero_f = std::make_shared<v0::Constant>(element_type, ov::Shape{}, 0.0f);
+    auto one_f = std::make_shared<v0::Constant>(element_type, ov::Shape{}, 1.0f);
+    auto minus_inf = std::make_shared<v0::Constant>(element_type, ov::Shape{}, -std::numeric_limits<float>::infinity());
+
+    // Extract shapes
+    // input_ids: [batch, seq_len]
+    auto input_ids_shape = std::make_shared<v3::ShapeOf>(input_ids, ov::element::i64);
+    auto batch_size = std::make_shared<v8::Gather>(input_ids_shape, zero_i, zero_i);
+    auto seq_len = std::make_shared<v8::Gather>(input_ids_shape, one_i, zero_i);
+
+    // attention_mask: [batch, total_seq_len] where total_seq_len = cache_len + seq_len
+    auto attn_mask_shape = std::make_shared<v3::ShapeOf>(attention_mask, ov::element::i64);
+    auto total_seq_len = std::make_shared<v8::Gather>(attn_mask_shape, one_i, zero_i);
+
+    // Calculate cache_len
+    auto cache_len = std::make_shared<v1::Subtract>(total_seq_len, seq_len);
+
+    // Step 1: Create causal mask pattern
+    // Create query positions: [0, 1, 2, ..., seq_len-1] with shape (seq_len, 1)
+    auto query_positions = std::make_shared<v4::Range>(zero_i, seq_len, one_i, ov::element::i64);
+    auto query_pos_unsqueeze = std::make_shared<v0::Unsqueeze>(query_positions, one_i);  // (seq_len, 1)
+
+    // Create key positions: [0, 1, 2, ..., total_seq_len-1] with shape (1, total_seq_len)
+    auto key_positions = std::make_shared<v4::Range>(zero_i, total_seq_len, one_i, ov::element::i64);
+    auto key_pos_unsqueeze = std::make_shared<v0::Unsqueeze>(key_positions, zero_i);  // (1, total_seq_len)
+
+    // Causal threshold: each query position i can attend to key positions [0, cache_len + i]
+    // For a lower triangular causal mask:
+    // - Query pos 0 can attend to keys [0, cache_len]
+    // - Query pos 1 can attend to keys [0, cache_len+1]
+    // - Query pos i can attend to keys [0, cache_len+i]
+    //
+    // Visual example with cache_len=10, seq_len=4, total_seq_len=14:
+    //   Q0: attend to [0-10], Q1: attend to [0-11], Q2: attend to [0-12], Q3: attend to [0-13]
+    //   Matrix (0=attend, X=mask):
+    //     Cache[0-9]  New[10-13]
+    // Q0: 0000000000  0 X X X    (all cache + T0)
+    // Q1: 0000000000  0 0 X X    (all cache + T0,T1)
+    // Q2: 0000000000  0 0 0 X    (all cache + T0,T1,T2)
+    // Q3: 0000000000  0 0 0 0    (all cache + T0,T1,T2,T3)
+    //
+    // When cache_len=0, standard causal: Q0->[0], Q1->[0,1], Q2->[0,1,2], etc.
+    auto causal_threshold = std::make_shared<v1::Add>(cache_len, query_pos_unsqueeze);
+
+    // Causal condition: key_pos <= threshold creates the lower triangular pattern
+    // This is correct: for each query i, allows attention to all keys j where j <= cache_len+i
+    auto causal_condition = std::make_shared<v1::LessEqual>(key_pos_unsqueeze, causal_threshold);
+
+    // Step 2: Process attention_mask
+    // Convert attention_mask to boolean: 1 -> true (valid), 0 -> false (masked)
+    auto attn_mask_bool = std::make_shared<v0::Convert>(attention_mask, ov::element::boolean);
+
+    // Expand attention_mask from [batch, total_seq_len] to [batch, 1, total_seq_len]
+    auto attn_mask_expanded = std::make_shared<v0::Unsqueeze>(attn_mask_bool, one_i);  // (batch, 1, total_seq_len)
+
+    // Step 3: Combine causal mask with attention_mask
+    // Broadcast causal_condition to (batch, seq_len, total_seq_len) by adding batch dimension
+    auto causal_expanded = std::make_shared<v0::Unsqueeze>(causal_condition, zero_i);  // (1, seq_len, total_seq_len)
+
+    // Logical AND: position is valid only if both causal allows AND attention_mask allows
+    auto combined_condition = std::make_shared<v1::LogicalAnd>(causal_expanded, attn_mask_expanded);
+
+    // Step 4: Convert boolean mask to float mask
+    // True (valid) -> 0.0, False (masked) -> -inf
+    auto float_mask = std::make_shared<v1::Select>(combined_condition, zero_f, minus_inf);
+
+    // Step 5: Add head dimension to get final shape (batch, 1, seq_len, total_seq_len)
+    auto final_mask = std::make_shared<v0::Unsqueeze>(float_mask, one_i);  // (batch, 1, seq_len, total_seq_len)
+
+    return final_mask;
+}
+
+std::string combine_key_value_name(std::string prefix,
+                                     std::string layer_id,
+                                     std::string key_or_value) {
+    return prefix + "." + layer_id + "." + key_or_value;
+}
+
+void set_node_name(std::shared_ptr<ov::Node> result, const std::string& name) {
+    result->set_friendly_name(name);
+    result->get_output_tensor(0).set_names({name});
+}
+
+void create_standalone_output_node(std::shared_ptr<ov::Model> model, const std::string& name, ov::element::Type type, const ov::PartialShape& shape) {
+    // Create a standalone Parameter node (not connected to any other nodes)
+    auto standalone_param = std::make_shared<ov::op::v0::Parameter>(type, shape);
+    standalone_param->set_friendly_name(name + "_param");
+
+    // Create a standalone Result node connected only to the parameter
+    auto result_node = std::make_shared<ov::op::v0::Result>(standalone_param);
+    set_node_name(result_node, name);
+
+    // Add the parameter and result to the model
+    model->add_parameters(ov::ParameterVector{standalone_param});
+    model->add_results(ov::ResultVector{result_node});
+}
+
+void create_output_node(std::shared_ptr<ov::Model> model, const std::string& output_name) {
+    // Search through all model outputs
+    for (auto& output : model->outputs()) {
+        // Check if this output has the target name
+        if (output.get_any_name() == output_name || output.get_names().count(output_name) > 0) {
+            // output.set_names({output_name + std::string("_chunk")});
+            set_node_name(output.get_node_shared_ptr(), output_name + std::string("_chunk"));
+            create_standalone_output_node(model, output_name, output.get_element_type(), output.get_partial_shape());
+            break;
+        }
+    }
+}
+
 class TransposeValueTensors : public ov::pass::MatcherPass {
 public:
     struct Context {
@@ -293,17 +505,6 @@ public:
     }
 };
 
-std::string combine_key_value_name(std::string prefix,
-                                     std::string layer_id,
-                                     std::string key_or_value) {
-    return prefix + "." + layer_id + "." + key_or_value;
-}
-
-void set_node_name(std::shared_ptr<ov::Node> result, const std::string& name) {
-    result->set_friendly_name(name);
-    result->get_output_tensor(0).set_names({name});
-}
-
 class AddKVCacheNodes : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::AddKVCacheNodes");
@@ -340,11 +541,11 @@ public:
 
             std::smatch match;
             if (std::regex_search(sdpa_node->get_friendly_name(), match, layer_id_convention)) {
-                  LOG_WARN("Extracted value: : " << match[1]);
-                  std::cout << "Extracted value: " << match[1] << std::endl;
+                  // LOG_WARN("Extracted value: : " << match[1]);
+                  // std::cout << "Extracted value: " << match[1] << std::endl;
               } else {
-                  std::cout << "No match found." << std::endl;
-                  LOG_WARN("No match found.");
+                  // std::cout << "No match found." << std::endl;
+                  // LOG_WARN("No match found.");
                   return false;
             }
 
@@ -405,6 +606,31 @@ public:
         };
 
         auto m = std::make_shared<ov::pass::pattern::Matcher>(sdpa, "AddKVCacheNodes");
+        register_matcher(m, std::move(callback));
+    }
+};
+
+class ReplaceMaskNodes : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::ReplaceMaskNodes");
+
+    explicit ReplaceMaskNodes(std::shared_ptr<ov::Model> model, ov::Output<ov::Node>& new_mask) {
+        auto pattern_node = ov::pass::pattern::wrap_type<ov::op::v13::ScaledDotProductAttention>();
+
+        ov::matcher_pass_callback callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& pattern_to_output = m.get_pattern_value_map();
+            auto node = ov::as_type_ptr<ov::op::v13::ScaledDotProductAttention>(
+                pattern_to_output.at(pattern_node).get_node_shared_ptr());
+
+            if (node == nullptr || transformation_callback(node)) {
+                return false;
+            }
+
+            node->input(3).replace_source_output(new_mask);
+            return true;
+        };
+
+        auto m = std::make_shared<ov::pass::pattern::Matcher>(pattern_node, "ReplaceMaskNodes");
         register_matcher(m, std::move(callback));
     }
 };
@@ -636,12 +862,59 @@ bool ov::npuw::util::optimize_value_tensors(std::shared_ptr<ov::Model> model, bo
     return ctx.bTransposed;
 }
 
-bool ov::npuw::util::add_kvcache_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
+namespace {
+
+bool add_kvcache_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
+    auto new_mask = create_qwen3_mask_subgraph(model->input("input_ids"), model->input("attention_mask"));
+    auto new_mask_out = std::make_shared<ov::op::v0::Result>(new_mask);
+    set_node_name(new_mask_out, std::string("new-mask"));
+    model->add_results(ov::ResultVector{new_mask_out});
+
+    //std::cout << "add_kvcache_nodes -1" << std::endl;
+    ov::pass::GraphRewrite mask_rewr;
+    mask_rewr.add_matcher<ReplaceMaskNodes>(model, new_mask);
+    mask_rewr.run_on_model(model);
+    ov::pass::Validate().run_on_model(model);
+    //std::cout << "add_kvcache_nodes -2" << std::endl;
+
     ov::pass::GraphRewrite rewr;
     rewr.add_matcher<AddKVCacheNodes>(model, seq_len_dim);
     rewr.run_on_model(model);
-
     ov::pass::Validate().run_on_model(model);
+    //std::cout << "add_kvcache_nodes -3" << std::endl;
+
+    return true;
+}
+
+void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::Model>& output_model) {
+    const auto output_name = std::string("last_hidden_state");
+
+    for (auto& output : model->outputs()) {
+        // Check if this output has the target name
+        if (output.get_any_name() == output_name || output.get_names().count(output_name) > 0) {
+            // output.set_names({output_name + std::string("_chunk")});
+            set_node_name(output.get_node_shared_ptr(), output_name + std::string("_chunk"));
+
+            auto standalone_param = std::make_shared<ov::op::v0::Parameter>(output.get_element_type(), output.get_partial_shape());
+            set_node_name(standalone_param, output_name + std::string("_param"));
+
+            // Create a standalone Result node connected only to the parameter
+            auto result_node = std::make_shared<ov::op::v0::Result>(standalone_param);
+            set_node_name(result_node, output_name);
+            output_model =
+                std::make_shared<ov::Model>(ov::OutputVector{result_node}, ov::ParameterVector{standalone_param});
+            output_model->set_friendly_name("last_hidden_state");
+
+            break;
+        }
+    }
+}
+
+} // namespace
+
+bool ov::npuw::util::rebuild_text_embedding_model(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim, std::shared_ptr<ov::Model>& output_model) {
+    add_kvcache_nodes(model, seq_len_dim);
+    create_output_model(model, output_model);
     return true;
 }
 

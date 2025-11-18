@@ -223,6 +223,17 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
                                       m_lm_head_request->get_tensor(lm_head_embed_port));
     }
 
+    if (compiled_model->text_embeddin_output_compiled) {
+        m_text_embeddin_output_request = compiled_model->text_embeddin_output_compiled->create_infer_request();
+        OPENVINO_ASSERT(m_text_embeddin_output_request);
+        m_last_hidden_state_port = m_text_embeddin_output_request->get_outputs()[0];
+        // m_last_hidden_state = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
+        std::cout << "m_last_hidden_state shape: " << std::endl;
+        for (auto dim : m_last_hidden_state_port.get_partial_shape()) {
+            std::cout << dim << std::endl;
+        }
+    }
+
     // FIXME: E-177589
     // FIXME: "fixes"/workarounds caching import on CPU (also might be related to bf16 weights).
     // Unclear how it's related. Previously fill_tensor()
@@ -591,6 +602,18 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         remaining_prompts = cache_context.remaining_prompts;
     }
 
+    ov::SoPtr<ov::ITensor> last_hidden_state_chunk_tesnor;
+    if (auto out_port = m_prefill_out_ports.find(layer_names::last_hidden_state_chunk);
+                out_port != m_prefill_in_ports.end()) {
+        last_hidden_state_chunk_tesnor = m_prefill_request->get_tensor(out_port->second);
+     }
+
+    ov::SoPtr<ov::ITensor> last_hidden_state_tesnor;
+    if (m_text_embeddin_output_request) {
+        last_hidden_state_tesnor = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
+    }
+
+    int i = 0;
     while (remaining_prompts > 0) {
         // NB: input_ids can be either fp32(VLM) or i64(LLM)
         // The last chunk may not be completely filled if the actual length of the prompts is not evenly divisible by
@@ -659,6 +682,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
         m_prefill_request->infer();
 
+        if (auto out_port = m_prefill_out_ports.find("new-mask");
+            out_port != m_prefill_in_ports.end()) {
+            ov::npuw::dump_tensor(m_prefill_request->get_tensor(out_port->second), std::string("mask-tensor_")+std::to_string(i)+std::string("_.bin"));
+        }
+        ++i;
+
         if (enable_prefix_caching) {
             m_prefix_caching_helper->store_computed_blocks(current_prompts_len,
                                                            cache_context.prompt_hashes,
@@ -667,6 +696,19 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
         remaining_prompts -= current_prompts_len;
         kvcache_desc.num_stored_tokens += static_cast<uint32_t>(current_prompts_len);
+
+        if (last_hidden_state_tesnor && last_hidden_state_chunk_tesnor) {
+            auto src = ov::npuw::util::make_tensor_slice(last_hidden_state_chunk_tesnor,
+                                                                1,
+                                                                0u,
+                                                                static_cast<uint32_t>(current_prompts_len));
+
+            auto dst = ov::npuw::util::make_tensor_slice(last_hidden_state_tesnor,
+                                                                1,
+                                                                kvcache_desc.num_stored_tokens - current_prompts_len,
+                                                                static_cast<uint32_t>(kvcache_desc.num_stored_tokens));
+            ov::npuw::util::copy_tensor_by_dim(src, dst, 1, 1);
+        }
 
         // Do not copy last computed chunk and preserve it in present k/v layer
         if (remaining_prompts <= 0) {
@@ -765,6 +807,8 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
         LOG_ERROR("Calling inference for LM head model.");
         m_lm_head_request->infer();
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+    } else if (m_text_embeddin_output_request) {
+        m_logits = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
     } else {
         LOG_ERROR("Calling inference without LM head model.");
 
@@ -887,6 +931,8 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         LOG_DEBUG("Calling inference for LM head model -- done.");
 
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
+    } else if (m_text_embeddin_output_request) {
+        m_logits = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);;
     } else {
         if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
             update_kvcache_for(m_kvcache_request,

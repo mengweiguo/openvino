@@ -29,6 +29,7 @@ public:
         static constexpr const char* token_type_ids = "token_type_ids";
         static constexpr const char* gemma_sliding_mask = "npuw_gemma_sliding_mask";
         static constexpr const char* last_hidden_state = "last_hidden_state";
+        static constexpr const char* last_hidden_state_chunk = "last_hidden_state_chunk";
     };
 
     struct layer_ids {
@@ -92,14 +93,17 @@ protected:
     std::shared_ptr<ov::npuw::IBaseInferRequest> m_prefill_base_request;
     // This infer request is optional, so can be null.
     std::shared_ptr<ov::IAsyncInferRequest> m_lm_head_request;
+    std::shared_ptr<ov::IAsyncInferRequest> m_text_embeddin_output_request;
     std::shared_ptr<LLMCompiledModel> m_npuw_llm_compiled_model;
     ov::SoPtr<ov::ITensor> m_logits;
+    // ov::SoPtr<ov::ITensor> m_last_hidden_state;
 
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_in_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_out_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_kvcache_in_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_kvcache_out_ports;
     ov::Output<const ov::Node> m_lm_head_logits_port;
+    ov::Output<const ov::Node> m_last_hidden_state_port;
 
     // Cache past_key_values ports for efficient clearing in prepare_for_new_conversation
     std::vector<ov::Output<const ov::Node>> m_prefill_past_kv_ports;
