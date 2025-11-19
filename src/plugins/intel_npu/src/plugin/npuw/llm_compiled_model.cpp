@@ -1444,7 +1444,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         convert_stateful_lora_to_stateless(kvcache_model);
     }
 
-    ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_after_modification.xml");
+    if (m_use_chunk_prefill) {
+        std::cout << "=== NPUW CHUNK enabled" << std::endl;
+    } else {
+        std::cout << "=== NPUW CHUNK disabled" << std::endl;
+    }
 
     LOG_DEBUG("   ...also convert BF16 to FP16");
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
@@ -1519,8 +1523,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                       m_max_lora_rank,
                       whisper_lhs_seq_size);
 
-    ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_kv_after_reshape.xml");
-    ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_after_reshape.xml");
+    // ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_kv_after_reshape.xml");
+    // ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_after_reshape.xml");
 
     LOG_DEBUG("Try parametrize Gemma sliding window mask, if it exists.");
     gemma_transformations(kvcache_model);
@@ -1536,7 +1540,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             }
         }
 
-        ov::save_model(text_embeddin_output_model, text_embeddin_output_model->get_friendly_name() + "_last_state.xml");
+        // ov::save_model(text_embeddin_output_model, text_embeddin_output_model->get_friendly_name() + "_last_state.xml");
     }
 
     if (lm_head_model) {
@@ -1695,8 +1699,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         rewr2.run_on_model(prefill_model);
     }
 
-    ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_kv_before_build.xml");
-    ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_before_build.xml");
+    // ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_kv_before_build.xml");
+    // ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_before_build.xml");
 
     std::cout << "start cache build" << std::endl;
     m_kvcache_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
@@ -1704,7 +1708,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     NPUW_ASSERT(m_kvcache_compiled && "Can't create ov::npuw::CompiledModel for passed kvcache "
                                       "model and its config, please check passed config.");
 
-    std::cout << "start prefill build" << std::endl;
+    std::cout << "start prefill build : v_tensors_transposed_pre = " << m_kvcache_desc.v_tensors_transposed_pre << std::endl;
 
     m_prefill_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
         ov::npuw::ICompiledModel::create(prefill_model, plugin, prefill_config));

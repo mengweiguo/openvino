@@ -635,6 +635,44 @@ public:
     }
 };
 
+class AddPositionIdsNode : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::AddPositionIdsNode");
+    explicit AddPositionIdsNode(std::shared_ptr<ov::Model> model) {
+        auto range = opp::wrap_type<ov::op::v4::Range>();
+        auto unsqueeze_axes = opp::wrap_type<ov::op::v0::Constant>();
+        auto unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({range, unsqueeze_axes});
+
+        auto unsqueeze1_axes = opp::wrap_type<ov::op::v0::Constant>();
+        auto unsqueeze1 = opp::wrap_type<ov::op::v0::Unsqueeze>({unsqueeze, unsqueeze1_axes});
+
+        auto convert = opp::wrap_type<ov::op::v0::Convert>({unsqueeze1});
+        auto matmul = opp::wrap_type<ov::op::v0::MatMul>({opp::any_input(), convert});
+        auto transpose = opp::wrap_type<ov::op::v1::Transpose>({matmul, opp::any_input()});
+
+        auto concat = opp::wrap_type<ov::op::v0::Concat>({transpose, transpose});
+        auto sin = opp::wrap_type<ov::op::v0::Sin>(concat);
+        auto cos = opp::wrap_type<ov::op::v0::Cos>(concat);
+
+        ov::matcher_pass_callback callback = [=](ov::pass::pattern::Matcher& m) {
+            auto& pattern_to_output = m.get_pattern_value_map();
+
+            auto unsqueeze1_node = pattern_to_output.at(unsqueeze1).get_node_shared_ptr();
+
+            auto position_ids =
+                std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+            set_node_name(position_ids, "position_ids");
+
+            unsqueeze1_node->input(0).replace_source_output(position_ids);
+            model->add_parameters(ov::ParameterVector{position_ids});
+            return true;
+        };
+
+        auto m = std::make_shared<ov::pass::pattern::Matcher>(cos, "AddPositionIdsNode");
+        register_matcher(m, std::move(callback));
+    }
+};
+
 class AttentionMaskInputPast : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("npuw::LLMCompiledModel::AttentionMaskInputPast");
@@ -864,11 +902,13 @@ bool ov::npuw::util::optimize_value_tensors(std::shared_ptr<ov::Model> model, bo
 
 namespace {
 
-bool add_kvcache_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
+bool add_kvcache_mask_position_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
     auto new_mask = create_qwen3_mask_subgraph(model->input("input_ids"), model->input("attention_mask"));
+#if 0
     auto new_mask_out = std::make_shared<ov::op::v0::Result>(new_mask);
     set_node_name(new_mask_out, std::string("new-mask"));
     model->add_results(ov::ResultVector{new_mask_out});
+#endif
 
     //std::cout << "add_kvcache_nodes -1" << std::endl;
     ov::pass::GraphRewrite mask_rewr;
@@ -877,9 +917,14 @@ bool add_kvcache_nodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
     ov::pass::Validate().run_on_model(model);
     //std::cout << "add_kvcache_nodes -2" << std::endl;
 
-    ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<AddKVCacheNodes>(model, seq_len_dim);
-    rewr.run_on_model(model);
+    ov::pass::GraphRewrite position_rewr;
+    position_rewr.add_matcher<AddPositionIdsNode>(model);
+    position_rewr.run_on_model(model);
+    ov::pass::Validate().run_on_model(model);
+
+    ov::pass::GraphRewrite kvcache_rewr;
+    kvcache_rewr.add_matcher<AddKVCacheNodes>(model, seq_len_dim);
+    kvcache_rewr.run_on_model(model);
     ov::pass::Validate().run_on_model(model);
     //std::cout << "add_kvcache_nodes -3" << std::endl;
 
@@ -913,7 +958,7 @@ void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::M
 } // namespace
 
 bool ov::npuw::util::rebuild_text_embedding_model(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim, std::shared_ptr<ov::Model>& output_model) {
-    add_kvcache_nodes(model, seq_len_dim);
+    add_kvcache_mask_position_nodes(model, seq_len_dim);
     create_output_model(model, output_model);
     return true;
 }

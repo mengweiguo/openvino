@@ -604,7 +604,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
     ov::SoPtr<ov::ITensor> last_hidden_state_chunk_tesnor;
     if (auto out_port = m_prefill_out_ports.find(layer_names::last_hidden_state_chunk);
-                out_port != m_prefill_in_ports.end()) {
+                out_port != m_prefill_out_ports.end()) {
         last_hidden_state_chunk_tesnor = m_prefill_request->get_tensor(out_port->second);
      }
 
@@ -683,10 +683,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         m_prefill_request->infer();
 
         if (auto out_port = m_prefill_out_ports.find("new-mask");
-            out_port != m_prefill_in_ports.end()) {
-            ov::npuw::dump_tensor(m_prefill_request->get_tensor(out_port->second), std::string("mask-tensor_")+std::to_string(i)+std::string("_.bin"));
+            out_port != m_prefill_out_ports.end()) {
+            // ov::npuw::dump_tensor(m_prefill_request->get_tensor(out_port->second), std::string("mask-tensor-after-infer_")+std::to_string(i));
         }
-        ++i;
 
         if (enable_prefix_caching) {
             m_prefix_caching_helper->store_computed_blocks(current_prompts_len,
@@ -694,10 +693,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                            cache_context.token_idx);
         }
 
-        remaining_prompts -= current_prompts_len;
-        kvcache_desc.num_stored_tokens += static_cast<uint32_t>(current_prompts_len);
-
         if (last_hidden_state_tesnor && last_hidden_state_chunk_tesnor) {
+            std::cout << "Copy result: " << i << std::endl;
             auto src = ov::npuw::util::make_tensor_slice(last_hidden_state_chunk_tesnor,
                                                                 1,
                                                                 0u,
@@ -705,10 +702,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
             auto dst = ov::npuw::util::make_tensor_slice(last_hidden_state_tesnor,
                                                                 1,
-                                                                kvcache_desc.num_stored_tokens - current_prompts_len,
-                                                                static_cast<uint32_t>(kvcache_desc.num_stored_tokens));
+                                                                kvcache_desc.num_stored_tokens,
+                                                                static_cast<uint32_t>(kvcache_desc.num_stored_tokens + current_prompts_len));
             ov::npuw::util::copy_tensor_by_dim(src, dst, 1, 1);
         }
+
+        remaining_prompts -= current_prompts_len;
+        kvcache_desc.num_stored_tokens += static_cast<uint32_t>(current_prompts_len);
 
         // Do not copy last computed chunk and preserve it in present k/v layer
         if (remaining_prompts <= 0) {
@@ -716,6 +716,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
             m_tokens_in_present_chunk = current_prompts_len;
             break;
         }
+        ++i;
 
         // Copy calculated key/values chunk from present k/v layer to past k/v layer for storage
         update_kvcache_for(m_prefill_request,
@@ -821,6 +822,12 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
         } else {
             OPENVINO_ASSERT(true);
         }
+    }
+
+    if (m_text_embeddin_output_request) {
+        ov::npuw::dump_tensor(m_logits, std::string("last_hidden_state_final-NPUW-CHUNK"));
+    } else {
+        ov::npuw::dump_tensor(m_logits, std::string("last_hidden_state_final-NPUW"));
     }
 
     m_generate_initialized = false;
@@ -965,6 +972,13 @@ void ov::npuw::LLMInferRequest::infer() {
     if (auto position_ids_port = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);
         position_ids_port.has_value()) {
         position_ids = get_tensor(position_ids_port.value());
+    } else {
+        position_ids = ov::make_tensor(ov::element::i64, attention_mask->get_shape());
+        std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
+        auto ids_data = position_ids->data<int64_t>();
+        for (int64_t i = 0; i < position_ids->get_size(); ++i) {
+            ids_data[i] = i;
+        }
     }
 
     auto token_type_ids = ov::npuw::util::TensorPtr();
