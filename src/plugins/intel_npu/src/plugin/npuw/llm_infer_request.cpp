@@ -585,10 +585,17 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
     auto attn_mask_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
 
-    auto pos_ids_in_tensor = ov::npuw::util::TensorPtr();
-    if (position_ids != nullptr) {
-        pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
+    if (position_ids == nullptr) {
+        position_ids = ov::make_tensor(ov::element::i64, attention_mask->get_shape());
+        std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
+        auto ids_data = position_ids->data<int64_t>();
+        for (int64_t i = 0; i < position_ids->get_size(); ++i) {
+            ids_data[i] = i;
+        }
     }
+
+    auto pos_ids_in_tensor = ov::npuw::util::TensorPtr();
+    pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
 
@@ -613,6 +620,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         last_hidden_state_tesnor = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
     }
 
+    auto offset_to_start = chunk_prompt_len - (remaining_prompts % chunk_prompt_len);
     int i = 0;
     while (remaining_prompts > 0) {
         // NB: input_ids can be either fp32(VLM) or i64(LLM)
@@ -694,16 +702,17 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         }
 
         if (last_hidden_state_tesnor && last_hidden_state_chunk_tesnor) {
-            std::cout << "Copy result: " << i << std::endl;
+            std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start << std::endl;
             auto src = ov::npuw::util::make_tensor_slice(last_hidden_state_chunk_tesnor,
                                                                 1,
-                                                                0u,
-                                                                static_cast<uint32_t>(current_prompts_len));
+                                                                chunk_prompt_len - current_prompts_len,
+                                                                static_cast<uint32_t>(chunk_prompt_len));
 
+            // padding on left side if offset_to_start > 0
             auto dst = ov::npuw::util::make_tensor_slice(last_hidden_state_tesnor,
                                                                 1,
-                                                                kvcache_desc.num_stored_tokens,
-                                                                static_cast<uint32_t>(kvcache_desc.num_stored_tokens + current_prompts_len));
+                                                                offset_to_start + kvcache_desc.num_stored_tokens,
+                                                                static_cast<uint32_t>(offset_to_start + kvcache_desc.num_stored_tokens + current_prompts_len));
             ov::npuw::util::copy_tensor_by_dim(src, dst, 1, 1);
         }
 
@@ -972,13 +981,6 @@ void ov::npuw::LLMInferRequest::infer() {
     if (auto position_ids_port = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);
         position_ids_port.has_value()) {
         position_ids = get_tensor(position_ids_port.value());
-    } else {
-        position_ids = ov::make_tensor(ov::element::i64, attention_mask->get_shape());
-        std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
-        auto ids_data = position_ids->data<int64_t>();
-        for (int64_t i = 0; i < position_ids->get_size(); ++i) {
-            ids_data[i] = i;
-        }
     }
 
     auto token_type_ids = ov::npuw::util::TensorPtr();
