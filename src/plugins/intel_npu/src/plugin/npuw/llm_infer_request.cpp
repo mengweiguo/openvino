@@ -609,12 +609,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         remaining_prompts = cache_context.remaining_prompts;
     }
 
-    ov::SoPtr<ov::ITensor> last_hidden_state_chunk_tesnor;
-    if (auto out_port = m_prefill_out_ports.find(layer_names::last_hidden_state_chunk);
-                out_port != m_prefill_out_ports.end()) {
-        last_hidden_state_chunk_tesnor = m_prefill_request->get_tensor(out_port->second);
-     }
-
+    auto output_tesnor = m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
     ov::SoPtr<ov::ITensor> last_hidden_state_tesnor;
     if (m_text_embeddin_output_request) {
         last_hidden_state_tesnor = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
@@ -701,9 +696,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                            cache_context.token_idx);
         }
 
-        if (last_hidden_state_tesnor && last_hidden_state_chunk_tesnor) {
+        if (last_hidden_state_tesnor) {
             std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start << std::endl;
-            auto src = ov::npuw::util::make_tensor_slice(last_hidden_state_chunk_tesnor,
+            auto src = ov::npuw::util::make_tensor_slice(output_tesnor,
                                                                 1,
                                                                 chunk_prompt_len - current_prompts_len,
                                                                 static_cast<uint32_t>(chunk_prompt_len));

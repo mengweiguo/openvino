@@ -29,7 +29,6 @@ public:
         static constexpr const char* token_type_ids = "token_type_ids";
         static constexpr const char* gemma_sliding_mask = "npuw_gemma_sliding_mask";
         static constexpr const char* last_hidden_state = "last_hidden_state";
-        static constexpr const char* last_hidden_state_chunk = "last_hidden_state_chunk";
     };
 
     struct layer_ids {

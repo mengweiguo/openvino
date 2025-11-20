@@ -938,7 +938,7 @@ void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::M
         // Check if this output has the target name
         if (output.get_any_name() == output_name || output.get_names().count(output_name) > 0) {
             // output.set_names({output_name + std::string("_chunk")});
-            set_node_name(output.get_node_shared_ptr(), output_name + std::string("_chunk"));
+            // set_node_name(output.get_node_shared_ptr(), output_name + std::string("_chunk"));
 
             auto standalone_param = std::make_shared<ov::op::v0::Parameter>(output.get_element_type(), output.get_partial_shape());
             set_node_name(standalone_param, output_name + std::string("_param"));
@@ -948,8 +948,6 @@ void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::M
             set_node_name(result_node, output_name);
             output_model =
                 std::make_shared<ov::Model>(ov::OutputVector{result_node}, ov::ParameterVector{standalone_param});
-            output_model->set_friendly_name("last_hidden_state");
-
             break;
         }
     }
