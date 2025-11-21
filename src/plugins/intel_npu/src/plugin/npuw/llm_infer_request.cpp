@@ -615,7 +615,8 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         last_hidden_state_tesnor = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
     }
 
-    auto offset_to_start = chunk_prompt_len - (remaining_prompts % chunk_prompt_len);
+    auto prompt_mod = remaining_prompts % chunk_prompt_len;
+    auto offset_to_start = prompt_mod == 0 ? 0 : chunk_prompt_len - prompt_mod;
     int i = 0;
     while (remaining_prompts > 0) {
         // NB: input_ids can be either fp32(VLM) or i64(LLM)
@@ -972,10 +973,14 @@ void ov::npuw::LLMInferRequest::infer() {
     auto input_ids = get_tensor(ov::npuw::util::find_port_by_name(inputs, m_input_ids_name).value());
     auto attention_mask = get_tensor(ov::npuw::util::find_port_by_name(inputs, layer_names::attention_mask).value());
 
+    std::cout << "input_ids size: " << input_ids->get_size() << std::endl;
+    std::cout << "attention_mask size: " << attention_mask->get_size() << std::endl;
+
     auto position_ids = ov::npuw::util::TensorPtr();
     if (auto position_ids_port = ov::npuw::util::find_port_by_name(inputs, layer_names::position_ids);
         position_ids_port.has_value()) {
         position_ids = get_tensor(position_ids_port.value());
+        std::cout << "position_ids size: " << position_ids->get_size() << std::endl;
     }
 
     auto token_type_ids = ov::npuw::util::TensorPtr();

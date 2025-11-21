@@ -1422,9 +1422,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         }
     }
 
-    LOG_VERB("Enabled prefill chunking: " << m_use_chunk_prefill);
-    LOG_VERB("Prefill chunk size: " << m_prefill_chunk_size);
-    LOG_VERB("Maximum prompt length: " << max_prompt_len);
+    LOG_ERROR("Enabled prefill chunking: " << m_use_chunk_prefill);
+    LOG_ERROR("Prefill chunk size: " << m_prefill_chunk_size);
+    LOG_ERROR("Maximum prompt length: " << max_prompt_len);
 
     const uint32_t batch_dim = m_cfg.get<::intel_npu::NPUW_LLM_BATCH_DIM>();
     const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
@@ -1432,14 +1432,15 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
-    LOG_DEBUG("Transform kvcache model from stateful to stateless.");
 
     std::shared_ptr<ov::Model> text_embeddin_output_model = nullptr;
     if (m_is_text_embed) {
         if (m_use_chunk_prefill) {
+            LOG_DEBUG("Text-Embedding Chunk rebuild");
             ov::npuw::util::rebuild_text_embedding_model(kvcache_model, seq_len_dim, text_embeddin_output_model);
         }
     } else {
+        LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
         convert_stateful_lora_to_stateless(kvcache_model);
     }
