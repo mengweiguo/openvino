@@ -226,10 +226,10 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     if (compiled_model->text_embeddin_output_compiled) {
         m_text_embeddin_output_request = compiled_model->text_embeddin_output_compiled->create_infer_request();
         OPENVINO_ASSERT(m_text_embeddin_output_request);
-        m_last_hidden_state_port = m_text_embeddin_output_request->get_outputs()[0];
+        auto output_port = m_text_embeddin_output_request->get_outputs()[0];
         // m_last_hidden_state = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
         std::cout << "m_last_hidden_state shape: " << std::endl;
-        for (auto dim : m_last_hidden_state_port.get_partial_shape()) {
+        for (auto dim : output_port.get_partial_shape()) {
             std::cout << dim << std::endl;
         }
     }
@@ -395,6 +395,12 @@ void ov::npuw::LLMInferRequest::prepare_for_new_conversation() {
         uu::fill_tensor_bytes(m_prefill_request->get_tensor(type_ids_port->second), 0u);
     }
     uu::fill_tensor<int64_t>(m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask)), 0);
+
+    if (m_text_embeddin_output_request) {
+        uu::fill_tensor<int64_t>(
+            m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_inputs()[1]),
+            1);
+    }
 
     if (auto pos_ids_port = m_prefill_in_ports.find(layer_names::position_ids);
         pos_ids_port != m_prefill_in_ports.end()) {
@@ -584,18 +590,16 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     const uint64_t chunk_prompt_len = m_npuw_llm_compiled_model->m_prefill_chunk_size;
 
     auto attn_mask_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::attention_mask));
+    auto pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
 
     if (position_ids == nullptr) {
         position_ids = ov::make_tensor(ov::element::i64, attention_mask->get_shape());
         std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
         auto ids_data = position_ids->data<int64_t>();
-        for (int64_t i = 0; i < position_ids->get_size(); ++i) {
+        for (size_t i = 0; i < position_ids->get_size(); ++i) {
             ids_data[i] = i;
         }
     }
-
-    auto pos_ids_in_tensor = ov::npuw::util::TensorPtr();
-    pos_ids_in_tensor = m_prefill_request->get_tensor(m_prefill_in_ports.at(layer_names::position_ids));
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
 
@@ -609,10 +613,16 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         remaining_prompts = cache_context.remaining_prompts;
     }
 
-    auto output_tesnor = m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
-    ov::SoPtr<ov::ITensor> last_hidden_state_tesnor;
+    auto prefill_output_tesnor = m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
+    ov::SoPtr<ov::ITensor> post_in_tesnor;
     if (m_text_embeddin_output_request) {
-        last_hidden_state_tesnor = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
+        post_in_tesnor = m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_inputs()[0]);
+        auto post_attention_mask =
+            m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_inputs()[1]);
+        std::copy_n(
+            attention_mask->data<int64_t>(),
+            attention_mask->get_size(),
+            post_attention_mask->data<int64_t>() + post_attention_mask->get_size() - attention_mask->get_size());
     }
 
     auto prompt_mod = remaining_prompts % chunk_prompt_len;
@@ -659,26 +669,24 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                     reinterpret_cast<uint8_t*>(input_ids_in_tensor->data()) + input_ids_in_tensor->get_byte_size() -
                         current_prefill_bytes);
 
-        if (pos_ids_in_tensor != nullptr) {
-            // NB: Regular LLM uses 2D position_ids [BATCH, SEQ_LEN], Qwen2.5 VL/Omni uses 3D position_ids [3, BATCH,
-            // SEQ_LEN]
-            // Copy postion ids with considering the 3D position_ids
-            auto last_dim = position_ids->get_shape().size() - 1;
-            auto actual_position_ids_slice = ov::npuw::util::make_tensor_slice(
-                position_ids,
-                static_cast<uint32_t>(last_dim),
-                kvcache_desc.num_stored_tokens,
-                kvcache_desc.num_stored_tokens + static_cast<uint32_t>(current_prompts_len));
+        // NB: Regular LLM uses 2D position_ids [BATCH, SEQ_LEN], Qwen2.5 VL/Omni uses 3D position_ids [3, BATCH,
+        // SEQ_LEN]
+        // Copy postion ids with considering the 3D position_ids
+        auto last_dim = position_ids->get_shape().size() - 1;
+        auto actual_position_ids_slice = ov::npuw::util::make_tensor_slice(
+            position_ids,
+            static_cast<uint32_t>(last_dim),
+            kvcache_desc.num_stored_tokens,
+            kvcache_desc.num_stored_tokens + static_cast<uint32_t>(current_prompts_len));
 
-            auto pos_ids_slice =
-                ov::npuw::util::make_tensor_slice(pos_ids_in_tensor,
-                                                  static_cast<uint32_t>(last_dim),
-                                                  static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
-                                                  static_cast<uint32_t>(chunk_prompt_len));
+        auto pos_ids_slice =
+            ov::npuw::util::make_tensor_slice(pos_ids_in_tensor,
+                                              static_cast<uint32_t>(last_dim),
+                                              static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
+                                              static_cast<uint32_t>(chunk_prompt_len));
 
-            // Copy with proper stride handling
-            actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
-        }
+        // Copy with proper stride handling
+        actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
 
         // Update history size for dynamic context:
         // dynamic attention selector needs history size to determin the past KV shape and attention mask shape
@@ -686,9 +694,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
         m_prefill_request->infer();
 
-        if (auto out_port = m_prefill_out_ports.find("new-mask");
-            out_port != m_prefill_out_ports.end()) {
-            // ov::npuw::dump_tensor(m_prefill_request->get_tensor(out_port->second), std::string("mask-tensor-after-infer_")+std::to_string(i));
+        if (auto out_port = m_prefill_out_ports.find("new-mask"); out_port != m_prefill_out_ports.end()) {
+            // ov::npuw::dump_tensor(m_prefill_request->get_tensor(out_port->second),
+            // std::string("mask-tensor-after-infer_")+std::to_string(i));
         }
 
         if (enable_prefix_caching) {
@@ -697,18 +705,20 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                            cache_context.token_idx);
         }
 
-        if (last_hidden_state_tesnor) {
-            std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start << std::endl;
-            auto src = ov::npuw::util::make_tensor_slice(output_tesnor,
-                                                                1,
-                                                                chunk_prompt_len - current_prompts_len,
-                                                                static_cast<uint32_t>(chunk_prompt_len));
+        if (post_in_tesnor) {
+            std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start
+                      << std::endl;
+            auto src = ov::npuw::util::make_tensor_slice(prefill_output_tesnor,
+                                                         1,
+                                                         chunk_prompt_len - current_prompts_len,
+                                                         static_cast<uint32_t>(chunk_prompt_len));
 
             // padding on left side if offset_to_start > 0
-            auto dst = ov::npuw::util::make_tensor_slice(last_hidden_state_tesnor,
-                                                                1,
-                                                                offset_to_start + kvcache_desc.num_stored_tokens,
-                                                                static_cast<uint32_t>(offset_to_start + kvcache_desc.num_stored_tokens + current_prompts_len));
+            auto dst = ov::npuw::util::make_tensor_slice(
+                post_in_tesnor,
+                1,
+                offset_to_start + kvcache_desc.num_stored_tokens,
+                static_cast<uint32_t>(offset_to_start + kvcache_desc.num_stored_tokens + current_prompts_len));
             ov::npuw::util::copy_tensor_by_dim(src, dst, 1, 1);
         }
 
@@ -749,6 +759,18 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
                                                     ov::SoPtr<ov::ITensor> token_type_ids) {
     LOG_DEBUG("Calling inference for prefill model in a single launch.");
     LOG_BLOCK();
+
+    if (m_text_embeddin_output_request) {
+        auto post_model_input_port = m_text_embeddin_output_request->get_inputs()[0];
+        m_prefill_request->set_tensor(m_prefill_request->get_outputs()[0],
+                                      m_text_embeddin_output_request->get_tensor(post_model_input_port));
+        auto post_attention_mask =
+            m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_inputs()[1]);
+        std::copy_n(
+            attention_mask->data<int64_t>(),
+            attention_mask->get_size(),
+            post_attention_mask->data<int64_t>() + post_attention_mask->get_size() - attention_mask->get_size());
+    }
 
     // NB: padded_input can be either fp32(VLM) or i64(LLM)
     auto padded_input = m_prefill_request->get_tensor(m_prefill_in_ports.at(m_input_ids_name));
@@ -814,10 +836,14 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
         m_lm_head_request->infer();
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
     } else if (m_text_embeddin_output_request) {
-        m_logits = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);
+        m_text_embeddin_output_request->infer();
+        m_logits = m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_outputs()[0]);
     } else {
         LOG_ERROR("Calling inference without LM head model.");
 
+        m_logits = m_prefill_request->get_tensor(m_prefill_request->get_outputs()[0]);
+
+#if 0
         if (auto out_port = m_prefill_out_ports.find(layer_names::logits);
             out_port != m_prefill_in_ports.end()) {
             m_logits = m_prefill_request->get_tensor(out_port->second);
@@ -827,9 +853,10 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
         } else {
             OPENVINO_ASSERT(true);
         }
+#endif
     }
 
-    if (m_text_embeddin_output_request) {
+    if (use_chunk_prefill) {
         ov::npuw::dump_tensor(m_logits, std::string("last_hidden_state_final-NPUW-CHUNK"));
     } else {
         ov::npuw::dump_tensor(m_logits, std::string("last_hidden_state_final-NPUW"));
@@ -864,10 +891,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         namespace uu = ov::npuw::util;
         uu::fill_tensor_bytes(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(m_input_ids_name)), 0u);
         uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::attention_mask)), 0);
-
-        if (position_ids != nullptr) {
-            uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids)), 0);
-        }
+        uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids)), 0);
 
         if (token_type_ids) {
             uu::fill_tensor<int64_t>(m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::token_type_ids)),
@@ -921,10 +945,8 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
     }
     std::fill_n(kv_attn_mask->data<int64_t>() + kv_attn_mask->get_size() - input_tokens_len, input_tokens_len, 1);
 
-    if (position_ids) {
-        auto kv_pos_ids = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids));
-        pad_position_ids(kv_pos_ids, position_ids);
-    }
+    auto kv_pos_ids = m_kvcache_request->get_tensor(m_kvcache_in_ports.at(layer_names::position_ids));
+    pad_position_ids(kv_pos_ids, position_ids);
 
     m_kvcache_request->infer();
     kvcache_desc.num_stored_tokens += input_tokens_len;
@@ -943,8 +965,6 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
         LOG_DEBUG("Calling inference for LM head model -- done.");
 
         m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
-    } else if (m_text_embeddin_output_request) {
-        m_logits = m_text_embeddin_output_request->get_tensor(m_last_hidden_state_port);;
     } else {
         if (kvcache_desc.num_stored_tokens < kvcache_desc.total_size) {
             update_kvcache_for(m_kvcache_request,
@@ -954,15 +974,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
                                kvcache_desc.v_tensors_transposed_gen);
         }
 
-        if (auto out_port = m_kvcache_out_ports.find(layer_names::logits);
-            out_port != m_kvcache_out_ports.end()) {
-            m_logits = m_kvcache_request->get_tensor(out_port->second);
-        } else if (auto out_port = m_kvcache_out_ports.find(layer_names::last_hidden_state);
-            out_port != m_kvcache_out_ports.end()) {
-            m_logits = m_kvcache_request->get_tensor(out_port->second);
-        } else {
-            OPENVINO_ASSERT(true);
-        }
+        m_logits = m_kvcache_request->get_tensor(m_kvcache_out_ports.at(layer_names::logits));
     }
 
     LOG_DEBUG("Done");

@@ -1199,6 +1199,14 @@ ov::AnyMap get_default_lm_head_config(const std::optional<NPUDesc>& npudesc) {
     return config;
 }
 
+ov::AnyMap get_default_text_embedding_post_config(const std::optional<NPUDesc>& npudesc) {
+    auto config = get_default_common_config(npudesc);
+    config.erase("NPUW_SLICE_OUT");
+    config.erase("NPUW_FUNCALL_ASYNC");
+    config.emplace("NPUW_ONLINE_PIPELINE", "NONE");
+    return config;
+}
+
 void merge_config_with(ov::AnyMap& lhs, const ov::AnyMap& rhs) {
     for (const auto& [key, value] : rhs) {
         // NB: Overwrite the value if key already exists
@@ -1342,6 +1350,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
       m_cfg(m_options_desc) {
     LOG_DEBUG("Creating LLMCompiledModel");
     LOG_BLOCK();
+    std::cout << "IN LLMCompiledModel LLM" << std::endl;
 
     ::intel_npu::registerNPUWLLMOptions(*m_options_desc);
 
@@ -1433,12 +1442,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
 
+    std::optional<ov::Any> post_type = pop_option(other_props, std::string("NPUW_TEXT_EMBED_POST_TYPE"));
+    auto post_type_string = post_type.value_or(std::string("last_token_left")).as<std::string>();
+
     std::shared_ptr<ov::Model> text_embeddin_output_model = nullptr;
     if (m_is_text_embed) {
         if (m_use_chunk_prefill) {
             LOG_DEBUG("Text-Embedding Chunk rebuild");
-            ov::npuw::util::rebuild_text_embedding_model(kvcache_model, seq_len_dim, text_embeddin_output_model);
+            ov::npuw::util::rebuild_text_embedding_model(kvcache_model, seq_len_dim);
         }
+        ov::npuw::util::create_post_process_model(kvcache_model, text_embeddin_output_model, post_type_string);
     } else {
         LOG_DEBUG("Transform kvcache model from stateful to stateless.");
         ov::pass::StatefulToStateless().run_on_model(kvcache_model);
@@ -1496,8 +1509,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     if (m_is_text_embed) {
-        m_kvcache_desc =
-            KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_prompt_len + min_response_len};
+        m_kvcache_desc = KVCacheDesc{max_prompt_len,
+                                     max_prompt_len + min_response_len,
+                                     0u,
+                                     seq_len_dim,
+                                     max_prompt_len + min_response_len};
     }
 
     LOG_DEBUG("Make prefill model with static shapes");
@@ -1531,17 +1547,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     gemma_transformations(kvcache_model);
 
     if (text_embeddin_output_model) {
-        for (const auto& input : text_embeddin_output_model->inputs()) {
-            const auto& input_name = input.get_any_name();
-            if (input_name.find("last_hidden_state") != std::string::npos) {
-                NPUW_ASSERT(input.get_partial_shape().size() == 3u);
-                auto new_shape = ov::PartialShape({1, m_kvcache_desc.max_prompt_size, input.get_partial_shape()[2]});
-                text_embeddin_output_model->reshape({{input_name, new_shape}});
-                break;
-            }
-        }
-
-        // ov::save_model(text_embeddin_output_model, text_embeddin_output_model->get_friendly_name() + "_last_state.xml");
+        auto input_node = text_embeddin_output_model->inputs()[0];
+        NPUW_ASSERT(input_node.get_partial_shape().size() == 3u);
+        auto new_shape = ov::PartialShape({1, m_kvcache_desc.max_prompt_size, input_node.get_partial_shape()[2]});
+        auto mask_shape = ov::PartialShape({1, m_kvcache_desc.max_prompt_size});
+        text_embeddin_output_model->reshape({{"input_ids", new_shape}, {"attention_mask", mask_shape}});
+        ov::save_model(text_embeddin_output_model, text_embeddin_output_model->get_friendly_name() + "_post.xml");
     }
 
     if (lm_head_model) {
@@ -1709,7 +1720,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     NPUW_ASSERT(m_kvcache_compiled && "Can't create ov::npuw::CompiledModel for passed kvcache "
                                       "model and its config, please check passed config.");
 
-    std::cout << "start prefill build : v_tensors_transposed_pre = " << m_kvcache_desc.v_tensors_transposed_pre << std::endl;
+    std::cout << "start prefill build : v_tensors_transposed_pre = " << m_kvcache_desc.v_tensors_transposed_pre
+              << std::endl;
 
     m_prefill_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
         ov::npuw::ICompiledModel::create(prefill_model, plugin, prefill_config));
@@ -1729,8 +1741,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     if (text_embeddin_output_model) {
+        std::cout << "start post model build :" << std::endl;
+        auto post_config = get_default_text_embedding_post_config(npudesc);
+        merge_config_with(post_config, other_props);
         text_embeddin_output_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
-            ov::npuw::ICompiledModel::create(text_embeddin_output_model, plugin, {}));
+            ov::npuw::ICompiledModel::create(text_embeddin_output_model, plugin, post_config));
     }
 
     implement_properties();

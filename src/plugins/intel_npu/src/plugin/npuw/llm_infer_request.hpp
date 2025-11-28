@@ -102,7 +102,6 @@ protected:
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_kvcache_in_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_kvcache_out_ports;
     ov::Output<const ov::Node> m_lm_head_logits_port;
-    ov::Output<const ov::Node> m_last_hidden_state_port;
 
     // Cache past_key_values ports for efficient clearing in prepare_for_new_conversation
     std::vector<ov::Output<const ov::Node>> m_prefill_past_kv_ports;

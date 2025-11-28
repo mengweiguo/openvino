@@ -32,8 +32,8 @@ namespace {
 // Considers actual attention_mask values (0 for masked positions, 1 for valid positions)
 // Output: causal mask tensor of shape (seq_len, seq_len + cache_len)
 ov::Output<ov::Node> create_llm_causal_mask_subgraph(const ov::Output<ov::Node>& input_ids,
-                                                       const ov::Output<ov::Node>& attention_mask,
-                                                       ov::element::Type element_type = ov::element::f32) {
+                                                     const ov::Output<ov::Node>& attention_mask,
+                                                     ov::element::Type element_type = ov::element::f32) {
     using namespace ov::op;
 
     // Constants
@@ -60,7 +60,8 @@ ov::Output<ov::Node> create_llm_causal_mask_subgraph(const ov::Output<ov::Node>&
 
     // Create horizontal range [0, 1, 2, ..., total_seq_len-1] with shape (1, total_seq_len)
     auto horizontal_range = std::make_shared<v4::Range>(zero_i, total_seq_len, one_i, ov::element::i64);
-    auto horizontal_range_unsqueeze = std::make_shared<v0::Unsqueeze>(horizontal_range, zero_i);  // shape: (1, total_seq_len)
+    auto horizontal_range_unsqueeze =
+        std::make_shared<v0::Unsqueeze>(horizontal_range, zero_i);  // shape: (1, total_seq_len)
 
     // For causal mask with KV cache:
     // - Cache positions [0, cache_len) are visible to all queries
@@ -90,11 +91,13 @@ ov::Output<ov::Node> create_llm_causal_mask_subgraph(const ov::Output<ov::Node>&
     auto attn_mask_bool = std::make_shared<v0::Convert>(attention_mask, ov::element::boolean);
 
     // Expand attention_mask from [batch, total_seq_len] to [batch, 1, total_seq_len]
-    auto attn_mask_expanded = std::make_shared<v0::Unsqueeze>(attn_mask_bool, one_i);  // shape: (batch, 1, total_seq_len)
+    auto attn_mask_expanded =
+        std::make_shared<v0::Unsqueeze>(attn_mask_bool, one_i);  // shape: (batch, 1, total_seq_len)
 
     // Step 3: Combine causal mask with attention_mask using LogicalAnd
     // Expand causal_condition to (1, seq_len, total_seq_len) for broadcasting
-    auto causal_expanded = std::make_shared<v0::Unsqueeze>(causal_condition, zero_i);  // shape: (1, seq_len, total_seq_len)
+    auto causal_expanded =
+        std::make_shared<v0::Unsqueeze>(causal_condition, zero_i);  // shape: (1, seq_len, total_seq_len)
 
     // Logical AND: position is valid only if both causal allows AND attention_mask allows
     // This correctly handles cases like attention_mask=[1,1,1,0,0,0,1,1,1]
@@ -118,8 +121,8 @@ ov::Output<ov::Node> create_llm_causal_mask_subgraph(const ov::Output<ov::Node>&
 //   - Values are 0.0 for positions that can be attended to
 //   - Values are -inf for masked positions
 ov::Output<ov::Node> create_qwen3_mask_subgraph(const ov::Output<ov::Node>& input_ids,
-                                                 const ov::Output<ov::Node>& attention_mask,
-                                                 ov::element::Type element_type = ov::element::f32) {
+                                                const ov::Output<ov::Node>& attention_mask,
+                                                ov::element::Type element_type = ov::element::f32) {
     using namespace ov::op;
 
     // Constants
@@ -200,9 +203,7 @@ ov::Output<ov::Node> create_qwen3_mask_subgraph(const ov::Output<ov::Node>& inpu
     return final_mask;
 }
 
-std::string combine_key_value_name(std::string prefix,
-                                     std::string layer_id,
-                                     std::string key_or_value) {
+std::string combine_key_value_name(std::string prefix, std::string layer_id, std::string key_or_value) {
     return prefix + "." + layer_id + "." + key_or_value;
 }
 
@@ -211,7 +212,10 @@ void set_node_name(std::shared_ptr<ov::Node> result, const std::string& name) {
     result->get_output_tensor(0).set_names({name});
 }
 
-void create_standalone_output_node(std::shared_ptr<ov::Model> model, const std::string& name, ov::element::Type type, const ov::PartialShape& shape) {
+void create_standalone_output_node(std::shared_ptr<ov::Model> model,
+                                   const std::string& name,
+                                   ov::element::Type type,
+                                   const ov::PartialShape& shape) {
     // Create a standalone Parameter node (not connected to any other nodes)
     auto standalone_param = std::make_shared<ov::op::v0::Parameter>(type, shape);
     standalone_param->set_friendly_name(name + "_param");
@@ -511,10 +515,10 @@ public:
     explicit AddKVCacheNodes(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
         const auto unsqueeze_axes = opp::wrap_type<ov::op::v0::Constant>();
         const auto transpose_order = opp::wrap_type<ov::op::v0::Constant>();
-        const std::regex layer_id_convention =
-            std::regex(R"(layers\.(\d+)\.self_attn)");
+        const std::regex layer_id_convention = std::regex(R"(layers\.(\d+)\.self_attn)");
 
-        auto shape_concat = opp::wrap_type<ov::op::v0::Concat>({opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
+        auto shape_concat = opp::wrap_type<ov::op::v0::Concat>(
+            {opp::any_input(), opp::any_input(), opp::any_input(), opp::any_input()});
 
         auto k_add = opp::wrap_type<ov::op::v1::Add>({opp::any_input(), opp::any_input()});
         auto k_unsqueeze = opp::wrap_type<ov::op::v0::Unsqueeze>({k_add, unsqueeze_axes});
@@ -526,7 +530,8 @@ public:
         auto v_broadcast = opp::wrap_type<ov::op::v1::Broadcast, ov::op::v3::Broadcast>({v_unsqueeze, shape_concat});
         auto v_reshape = opp::wrap_type<ov::op::v1::Reshape>({v_broadcast, opp::any_input()});
 
-        auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>({opp::any_input(), k_reshape, v_reshape, opp::any_input(), opp::any_input()});
+        auto sdpa = opp::wrap_type<ov::op::v13::ScaledDotProductAttention>(
+            {opp::any_input(), k_reshape, v_reshape, opp::any_input(), opp::any_input()});
 
         ov::matcher_pass_callback callback = [=](ov::pass::pattern::Matcher& m) {
             auto& pattern_to_output = m.get_pattern_value_map();
@@ -541,19 +546,18 @@ public:
 
             std::smatch match;
             if (std::regex_search(sdpa_node->get_friendly_name(), match, layer_id_convention)) {
-                  // LOG_WARN("Extracted value: : " << match[1]);
-                  // std::cout << "Extracted value: " << match[1] << std::endl;
-              } else {
-                  // std::cout << "No match found." << std::endl;
-                  // LOG_WARN("No match found.");
-                  return false;
+                // LOG_WARN("Extracted value: : " << match[1]);
+                // std::cout << "Extracted value: " << match[1] << std::endl;
+            } else {
+                // std::cout << "No match found." << std::endl;
+                // LOG_WARN("No match found.");
+                return false;
             }
 
             auto layer_id = std::string(match[1]);
             auto k_add_out_shape = k_add_node->get_output_partial_shape(0);
             auto k_add_type = k_add_node->get_output_element_type(0);
-            auto k_cache =
-                std::make_shared<ov::op::v0::Parameter>(k_add_type, k_add_out_shape);
+            auto k_cache = std::make_shared<ov::op::v0::Parameter>(k_add_type, k_add_out_shape);
             set_node_name(k_cache, combine_key_value_name("past_key_values", layer_id, "key"));
 
             auto k_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{k_cache, k_add_node}, seq_len_dim);
@@ -566,11 +570,11 @@ public:
 
             auto v_transpose_out_shape = v_transpose_node->get_output_partial_shape(0);
             auto v_transpose_type = v_transpose_node->get_output_element_type(0);
-            auto v_cache =
-                std::make_shared<ov::op::v0::Parameter>(v_transpose_type, v_transpose_out_shape);
+            auto v_cache = std::make_shared<ov::op::v0::Parameter>(v_transpose_type, v_transpose_out_shape);
             set_node_name(v_cache, combine_key_value_name("past_key_values", layer_id, "value"));
 
-            auto v_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{v_cache, v_transpose_node}, seq_len_dim);
+            auto v_concat =
+                register_new_node<ov::op::v0::Concat>(ov::OutputVector{v_cache, v_transpose_node}, seq_len_dim);
             set_node_name(v_concat, combine_key_value_name("concat", layer_id, "value"));
 
             v_unsqueeze_node->input(0).replace_source_output(v_concat);
@@ -597,8 +601,12 @@ public:
             auto s_len_add = std::make_shared<ov::op::v1::Add>(k_s_len, k_cache_s_len);
             auto s_len_reshape = std::make_shared<ov::op::v1::Reshape>(s_len_add, one_i, false);
 
-            auto new_shape_concat = register_new_node<ov::op::v0::Concat>(ov::OutputVector{concat_shape_node->input(0).get_source_output(),
-                concat_shape_node->input(1).get_source_output(), s_len_reshape, concat_shape_node->input(3).get_source_output()}, 0);
+            auto new_shape_concat =
+                register_new_node<ov::op::v0::Concat>(ov::OutputVector{concat_shape_node->input(0).get_source_output(),
+                                                                       concat_shape_node->input(1).get_source_output(),
+                                                                       s_len_reshape,
+                                                                       concat_shape_node->input(3).get_source_output()},
+                                                      0);
             k_broadcast_node->input(1).replace_source_output(new_shape_concat);
             v_broadcast_node->input(1).replace_source_output(new_shape_concat);
 
@@ -659,8 +667,7 @@ public:
 
             auto unsqueeze1_node = pattern_to_output.at(unsqueeze1).get_node_shared_ptr();
 
-            auto position_ids =
-                std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+            auto position_ids = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
             set_node_name(position_ids, "position_ids");
 
             unsqueeze1_node->input(0).replace_source_output(position_ids);
@@ -910,12 +917,12 @@ bool add_kvcache_mask_position_nodes(std::shared_ptr<ov::Model> model, uint32_t 
     model->add_results(ov::ResultVector{new_mask_out});
 #endif
 
-    //std::cout << "add_kvcache_nodes -1" << std::endl;
+    // std::cout << "add_kvcache_nodes -1" << std::endl;
     ov::pass::GraphRewrite mask_rewr;
     mask_rewr.add_matcher<ReplaceMaskNodes>(model, new_mask);
     mask_rewr.run_on_model(model);
     ov::pass::Validate().run_on_model(model);
-    //std::cout << "add_kvcache_nodes -2" << std::endl;
+    // std::cout << "add_kvcache_nodes -2" << std::endl;
 
     ov::pass::GraphRewrite position_rewr;
     position_rewr.add_matcher<AddPositionIdsNode>(model);
@@ -926,14 +933,96 @@ bool add_kvcache_mask_position_nodes(std::shared_ptr<ov::Model> model, uint32_t 
     kvcache_rewr.add_matcher<AddKVCacheNodes>(model, seq_len_dim);
     kvcache_rewr.run_on_model(model);
     ov::pass::Validate().run_on_model(model);
-    //std::cout << "add_kvcache_nodes -3" << std::endl;
+    // std::cout << "add_kvcache_nodes -3" << std::endl;
 
     return true;
 }
 
-void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::Model>& output_model) {
-    const auto output_name = std::string("last_hidden_state");
+/**
+ * CLS pooling slices first element from seq_length dimension
+ * [batch_size, seq_length, hidden_size] -> [batch_size, seq_length[0], hidden_size]
+ * [10, 5, 768] -> [10, 768]
+ */
+std::shared_ptr<ov::op::Op> get_cls_pooling_op(const ov::Output<ov::Node>& last_hidden_state_node) {
+    using namespace ov;
+    auto start = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{0});
+    auto stop = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+    auto step = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+    auto axis = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
 
+    auto slice = std::make_shared<op::v8::Slice>(last_hidden_state_node, start, stop, step, axis);
+
+    auto squeeze_axis = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+    return std::make_shared<op::v15::Squeeze>(slice, squeeze_axis);
+}
+
+std::shared_ptr<ov::op::Op> get_mean_pooling_op(std::shared_ptr<ov::Model> model,
+                                                const ov::Output<ov::Node>& last_hidden_state_node,
+                                                const ov::Output<ov::Node>& attention_mask) {
+    using namespace ov;
+    auto shape_of = std::make_shared<op::v3::ShapeOf>(last_hidden_state_node);
+
+    auto unsqueze_axis = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+
+    auto unsqueze = std::make_shared<op::v0::Unsqueeze>(attention_mask, unsqueze_axis);
+
+    auto input_mask_expanded = std::make_shared<op::v3::Broadcast>(unsqueze, shape_of);
+
+    auto input_mask_expanded_convert =
+        std::make_shared<op::v0::Convert>(input_mask_expanded, last_hidden_state_node.get_element_type());
+
+    auto last_hidden_node_with_applied_attention_mask =
+        std::make_shared<op::v1::Multiply>(last_hidden_state_node, input_mask_expanded_convert->outputs()[0]);
+
+    auto axis_1 = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+    auto sum_hidden_state = std::make_shared<op::v1::ReduceSum>(last_hidden_node_with_applied_attention_mask, axis_1);
+
+    // f32 overflow possible
+    // ReduceMean might help with overflow but its precision diverges from LlamaIndex
+    auto sum_expanded_mask = std::make_shared<op::v1::ReduceSum>(input_mask_expanded_convert, axis_1);
+
+    auto nearest_to_zero =
+        std::make_shared<op::v0::Constant>(ov::element::f32, ov::Shape{1}, std::vector<float>{1e-12});
+    auto max_expanded_mask = std::make_shared<op::v1::Maximum>(sum_expanded_mask, nearest_to_zero);
+
+    // shape: [batch_size, hidden_state_size]
+    return std::make_shared<op::v1::Divide>(sum_hidden_state, max_expanded_mask);
+}
+
+std::shared_ptr<ov::op::Op> get_last_token_pooling_op(std::shared_ptr<ov::Model> model,
+                                                      const ov::Output<ov::Node>& last_hidden_state_node,
+                                                      const ov::Output<ov::Node>& attention_mask,
+                                                      std::string& post_type) {
+    using namespace ov;
+    // shortcut for left padding. We can slice last token directly
+    if (post_type == "last_token_left") {
+        auto start = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+        auto stop = std::make_shared<op::v0::Constant>(ov::element::i64,
+                                                       ov::Shape{1},
+                                                       std::vector<int64_t>{std::numeric_limits<int64_t>::max()});
+        auto step = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+        auto axis = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+
+        auto slice = std::make_shared<op::v8::Slice>(last_hidden_state_node, start, stop, step, axis);
+
+        auto squeeze_axis = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+        return std::make_shared<op::v15::Squeeze>(slice, squeeze_axis);
+    }
+
+    auto one = std::make_shared<op::v0::Constant>(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{1});
+    auto reduce_sum = std::make_shared<op::v1::ReduceSum>(attention_mask, one);
+    auto subtract = std::make_shared<op::v1::Subtract>(reduce_sum, one);
+
+    return std::make_shared<op::v8::Gather>(last_hidden_state_node, subtract, one, 1);
+}
+
+}  // namespace
+
+void ov::npuw::util::create_post_process_model(std::shared_ptr<ov::Model> model,
+                                               std::shared_ptr<ov::Model>& post_model,
+                                               std::string post_type) {
+#if 0
+    const auto output_name = std::string("last_hidden_state");
     for (auto& output : model->outputs()) {
         // Check if this output has the target name
         if (output.get_any_name() == output_name || output.get_names().count(output_name) > 0) {
@@ -951,13 +1040,36 @@ void create_output_model(std::shared_ptr<ov::Model> model, std::shared_ptr<ov::M
             break;
         }
     }
+#endif
+
+    auto output_node = model->outputs()[0];
+    auto input_param =
+        std::make_shared<ov::op::v0::Parameter>(output_node.get_element_type(), output_node.get_partial_shape());
+    set_node_name(input_param, "input_ids");
+
+    auto attention_mask = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::PartialShape{-1, -1});
+    set_node_name(attention_mask, "attention_mask");
+
+    std::cout << "create_post_process_model: type: " << post_type << std::endl;
+
+    std::shared_ptr<ov::op::Op> post_output;
+    if (post_type == "cls") {
+        post_output = get_cls_pooling_op(input_param);
+    } else if (post_type == "mean") {
+        post_output = get_mean_pooling_op(model, input_param, attention_mask);
+    } else if (post_type == "last_token_left" || post_type == "last_token_right") {
+        post_output = get_last_token_pooling_op(model, input_param, attention_mask, post_type);
+    }
+
+    auto result_node = std::make_shared<ov::op::v0::Result>(post_output);
+    post_model =
+        std::make_shared<ov::Model>(ov::OutputVector{result_node}, ov::ParameterVector{input_param, attention_mask});
+    post_model->set_friendly_name(model->get_friendly_name() + "_post_process");
 }
 
-} // namespace
-
-bool ov::npuw::util::rebuild_text_embedding_model(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim, std::shared_ptr<ov::Model>& output_model) {
+bool ov::npuw::util::rebuild_text_embedding_model(std::shared_ptr<ov::Model> model, uint32_t seq_len_dim) {
     add_kvcache_mask_position_nodes(model, seq_len_dim);
-    create_output_model(model, output_model);
+    // create_post_process_model(model, output_model, post_type);
     return true;
 }
 
