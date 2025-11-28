@@ -85,6 +85,7 @@ private:
     std::shared_ptr<ov::npuw::CompiledModel> m_prefill_compiled;
     // This model is optional, so can be null.
     std::shared_ptr<ov::npuw::CompiledModel> m_lm_head_compiled;
+    std::shared_ptr<ov::npuw::CompiledModel> text_embeddin_output_compiled;
 
     // Support LoRA
     void convert_stateful_lora_to_stateless(std::shared_ptr<ov::Model>& model);
@@ -102,6 +103,7 @@ private:
     int32_t m_gemma_sliding_window_size = 0;
 
     bool m_is_whisper = false;
+    bool m_is_text_embed = false;
 };
 
 }  // namespace npuw

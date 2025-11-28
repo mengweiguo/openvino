@@ -28,6 +28,7 @@ public:
         static constexpr const char* logits = "logits";
         static constexpr const char* token_type_ids = "token_type_ids";
         static constexpr const char* gemma_sliding_mask = "npuw_gemma_sliding_mask";
+        static constexpr const char* last_hidden_state = "last_hidden_state";
     };
 
     struct layer_ids {
@@ -91,8 +92,10 @@ protected:
     std::shared_ptr<ov::npuw::IBaseInferRequest> m_prefill_base_request;
     // This infer request is optional, so can be null.
     std::shared_ptr<ov::IAsyncInferRequest> m_lm_head_request;
+    std::shared_ptr<ov::IAsyncInferRequest> m_text_embeddin_output_request;
     std::shared_ptr<LLMCompiledModel> m_npuw_llm_compiled_model;
     ov::SoPtr<ov::ITensor> m_logits;
+    // ov::SoPtr<ov::ITensor> m_last_hidden_state;
 
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_in_ports;
     std::unordered_map<std::string, ov::Output<const ov::Node>> m_prefill_out_ports;
