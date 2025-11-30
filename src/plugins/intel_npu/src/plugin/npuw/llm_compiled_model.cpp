@@ -1712,7 +1712,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     }
 
     // ov::save_model(kvcache_model, kvcache_model->get_friendly_name() + "_kv_before_build.xml");
-    // ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_before_build.xml");
+    ov::save_model(prefill_model, prefill_model->get_friendly_name() + "_prefill_before_build.xml");
 
     std::cout << "start cache build" << std::endl;
     m_kvcache_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
@@ -1858,6 +1858,7 @@ void ov::npuw::LLMCompiledModel::serialize(std::ostream& stream, const ov::npuw:
         write(model_stream, m_prefix_caching_max_num_blocks);
         write(model_stream, m_gemma_sliding_window_size);
         write(model_stream, m_is_whisper);
+        write(model_stream, m_is_text_embed);
 
         // Write config
         write(model_stream, m_cfg);
@@ -2070,6 +2071,7 @@ std::shared_ptr<ov::npuw::LLMCompiledModel> ov::npuw::LLMCompiledModel::deserial
         read(model_stream, compiled->m_prefix_caching_max_num_blocks);
         read(model_stream, compiled->m_gemma_sliding_window_size);
         read(model_stream, compiled->m_is_whisper);
+        read(model_stream, compiled->m_is_text_embed);
 
         // Deserialize config
         read(model_stream, compiled->m_cfg);

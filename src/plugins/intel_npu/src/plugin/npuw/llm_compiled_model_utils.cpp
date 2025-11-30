@@ -212,36 +212,6 @@ void set_node_name(std::shared_ptr<ov::Node> result, const std::string& name) {
     result->get_output_tensor(0).set_names({name});
 }
 
-void create_standalone_output_node(std::shared_ptr<ov::Model> model,
-                                   const std::string& name,
-                                   ov::element::Type type,
-                                   const ov::PartialShape& shape) {
-    // Create a standalone Parameter node (not connected to any other nodes)
-    auto standalone_param = std::make_shared<ov::op::v0::Parameter>(type, shape);
-    standalone_param->set_friendly_name(name + "_param");
-
-    // Create a standalone Result node connected only to the parameter
-    auto result_node = std::make_shared<ov::op::v0::Result>(standalone_param);
-    set_node_name(result_node, name);
-
-    // Add the parameter and result to the model
-    model->add_parameters(ov::ParameterVector{standalone_param});
-    model->add_results(ov::ResultVector{result_node});
-}
-
-void create_output_node(std::shared_ptr<ov::Model> model, const std::string& output_name) {
-    // Search through all model outputs
-    for (auto& output : model->outputs()) {
-        // Check if this output has the target name
-        if (output.get_any_name() == output_name || output.get_names().count(output_name) > 0) {
-            // output.set_names({output_name + std::string("_chunk")});
-            set_node_name(output.get_node_shared_ptr(), output_name + std::string("_chunk"));
-            create_standalone_output_node(model, output_name, output.get_element_type(), output.get_partial_shape());
-            break;
-        }
-    }
-}
-
 class TransposeValueTensors : public ov::pass::MatcherPass {
 public:
     struct Context {
@@ -982,7 +952,7 @@ std::shared_ptr<ov::op::Op> get_mean_pooling_op(std::shared_ptr<ov::Model> model
     auto sum_expanded_mask = std::make_shared<op::v1::ReduceSum>(input_mask_expanded_convert, axis_1);
 
     auto nearest_to_zero =
-        std::make_shared<op::v0::Constant>(ov::element::f32, ov::Shape{1}, std::vector<float>{1e-12});
+        std::make_shared<op::v0::Constant>(ov::element::f32, ov::Shape{1}, std::vector<float>{static_cast<float>(1e-7)});
     auto max_expanded_mask = std::make_shared<op::v1::Maximum>(sum_expanded_mask, nearest_to_zero);
 
     // shape: [batch_size, hidden_state_size]

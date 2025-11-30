@@ -399,7 +399,7 @@ void ov::npuw::LLMInferRequest::prepare_for_new_conversation() {
     if (m_text_embeddin_output_request) {
         uu::fill_tensor<int64_t>(
             m_text_embeddin_output_request->get_tensor(m_text_embeddin_output_request->get_inputs()[1]),
-            1);
+            0);
     }
 
     if (auto pos_ids_port = m_prefill_in_ports.find(layer_names::position_ids);
@@ -594,11 +594,9 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
     if (position_ids == nullptr) {
         position_ids = ov::make_tensor(ov::element::i64, attention_mask->get_shape());
-        std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
+        // std::cout << "position_ids size = " << position_ids->get_size() << std::endl;
         auto ids_data = position_ids->data<int64_t>();
-        for (size_t i = 0; i < position_ids->get_size(); ++i) {
-            ids_data[i] = i;
-        }
+        std::iota(ids_data, ids_data + position_ids->get_size(), 0);
     }
 
     auto& kvcache_desc = m_npuw_llm_compiled_model->m_kvcache_desc;
@@ -626,7 +624,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
     }
 
     auto prompt_mod = remaining_prompts % chunk_prompt_len;
-    auto offset_to_start = prompt_mod == 0 ? 0 : chunk_prompt_len - prompt_mod;
+    auto offset_to_start = 0; // prompt_mod == 0 ? 0 : chunk_prompt_len - prompt_mod;
     int i = 0;
     while (remaining_prompts > 0) {
         // NB: input_ids can be either fp32(VLM) or i64(LLM)
@@ -706,18 +704,18 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
         }
 
         if (post_in_tesnor) {
-            std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start
-                      << std::endl;
+            // std::cout << "Copy result: " << i << " len: " << current_prompts_len << " offset: " << offset_to_start
+            //           << std::endl;
             auto src = ov::npuw::util::make_tensor_slice(prefill_output_tesnor,
                                                          1,
-                                                         chunk_prompt_len - current_prompts_len,
+                                                         static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
                                                          static_cast<uint32_t>(chunk_prompt_len));
 
             // padding on left side if offset_to_start > 0
             auto dst = ov::npuw::util::make_tensor_slice(
                 post_in_tesnor,
                 1,
-                offset_to_start + kvcache_desc.num_stored_tokens,
+                static_cast<uint32_t>(offset_to_start + kvcache_desc.num_stored_tokens),
                 static_cast<uint32_t>(offset_to_start + kvcache_desc.num_stored_tokens + current_prompts_len));
             ov::npuw::util::copy_tensor_by_dim(src, dst, 1, 1);
         }
