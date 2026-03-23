@@ -887,6 +887,11 @@ std::string ov::npuw::util::generate_random_string(std::size_t size) {
     return result;
 }
 
+bool ov::npuw::util::matchSSMString(const std::string& input) {
+    std::regex regex_pattern(R"(cache_params\.past\.(ssm|conv)\.\d+)");
+    return std::regex_match(input, regex_pattern);
+}
+
 bool ov::npuw::util::matchStringWithLoRAPattern(const std::string& input, const std::string& pattern_suffix) {
     std::string pattern = "^lora_state.*" + pattern_suffix + "$";
     std::regex regex_pattern(pattern);

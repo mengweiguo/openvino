@@ -153,5 +153,48 @@ bool ov::pass::StatefulToStateless::run_on_model(const std::shared_ptr<ov::Model
     model->add_parameters(new_parameters);
     model->add_results(new_results);
 
+    ov::ParameterVector remain_parameters;
+    ov::ResultVector remain_results;
+    // Pre-cache all ReadValue nodes by variable_id to avoid repeated get_ordered_ops() calls
+    std::unordered_map<std::string, std::shared_ptr<op::util::ReadValueBase>> read_values_by_var_id;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (auto rv = ov::as_type_ptr<op::util::ReadValueBase>(node)) {
+            read_values_by_var_id[rv->get_variable_id()] = rv;
+        }
+    }
+
+    const auto sinks_remain = model->get_sinks();  // copy, not reference — we mutate sinks below
+    for (size_t i = 0; i < sinks_remain.size(); ++i) {
+        auto assign = ov::as_type_ptr<op::util::AssignBase>(sinks_remain[i]);
+        if (!assign)
+            continue;
+        const auto& var_id = assign->get_variable_id();
+        Variable var(context, var_id);
+
+        // Find the corresponding ReadValue node for this variable
+        auto read_value = ov::as_type_ptr<op::util::ReadValueBase>(assign->get_input_node_shared_ptr(0));
+        if (!read_value) {
+            auto it = read_values_by_var_id.find(var_id);
+            if (it != read_values_by_var_id.end())
+                read_value = it->second;
+        }
+        OPENVINO_ASSERT(read_value, "StatefulToStateless: cannot find ReadValue for remaining variable '", var_id, "'");
+
+        auto parameter = std::make_shared<v0::Parameter>(read_value->get_output_element_type(0),
+                                                         read_value->get_output_partial_shape(0));
+        ov::op::util::set_name(*parameter, var.input_name);
+        replace_node(read_value, parameter);
+
+        auto result = std::make_shared<v0::Result>(assign->input_value(0));
+        ov::op::util::set_name(*result, var.output_name);
+
+        model->remove_sink(assign);
+        model->remove_variable(model->get_variable_by_id(var_id));
+        remain_parameters.push_back(std::move(parameter));
+        remain_results.push_back(std::move(result));
+    }
+    model->add_parameters(remain_parameters);
+    model->add_results(remain_results);
+
     return true;
 }
