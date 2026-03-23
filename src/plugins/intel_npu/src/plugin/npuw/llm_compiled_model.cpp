@@ -1098,6 +1098,7 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
     std::map<std::string, ov::PartialShape> new_shapes;
     for (const auto& input : model->inputs()) {
         const auto& input_name = input.get_any_name();
+        // std::cout << "=== " << input_name << " " << input.get_partial_shape() << std::endl;
         ov::PartialShape new_shape;
         if (input_name.find("input_ids") != std::string::npos) {
             new_shape = ov::PartialShape({1, input_size});
@@ -1137,6 +1138,10 @@ void reshape_to_static(std::shared_ptr<ov::Model> model,
             new_shape = ov::PartialShape({input.get_partial_shape()[0], lora_rank});
         } else if (ov::npuw::util::matchLoRAMatMulBString(input_name)) {
             new_shape = ov::PartialShape({input.get_partial_shape()[0], lora_rank});
+        } else if (ov::npuw::util::matchSSMString(input_name)) {
+            // std::cout << "+++ " << input_name << std::endl;
+            new_shape = input.get_partial_shape();
+            new_shape[kv_axes_position.batch] = 1;
         } else {
             const auto& partial_shape = input.get_partial_shape();
             new_shape = partial_shape;

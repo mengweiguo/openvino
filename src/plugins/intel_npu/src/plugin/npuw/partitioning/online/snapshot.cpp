@@ -8,6 +8,7 @@
 #include "../../util.hpp"
 #include "../patterns/avoid.hpp"
 #include "../patterns/compute.hpp"
+#include "../patterns/mamba.hpp"
 #include "../patterns/moe.hpp"
 #include "../patterns/sdpa.hpp"
 #include "group.hpp"
@@ -675,6 +676,11 @@ void Snapshot::earlyRegroup() {
         rewr.add_matcher<ov::npuw::patterns::moe::p>(shared_from_this(), isolate.tag); \
         handle_patterns = true;                                                        \
     }
+#define HNDL_SSM(p)                                                                    \
+    if (isolate.pattern == #p) {                                                       \
+        rewr.add_matcher<ov::npuw::patterns::ssm::p>(shared_from_this(), isolate.tag); \
+        handle_patterns = true;                                                        \
+    }
             HNDL(RMSNorm);
             HNDL(RMSNorm2);
             HNDL(RMSNorm3);
@@ -692,6 +698,9 @@ void Snapshot::earlyRegroup() {
             HNDL_FAKE(FakeQuantize);
             HNDL_ATTN(SDPA);
             HNDL_ATTN(SDPADecomposed);
+            HNDL_SSM(MambaBlock);
+            // HNDL_SSM(MambaBlockByName);  // disabled: BFS scope issues, to be fixed separately
+#undef HNDL_SSM
 #undef HNDL_MOE
 #undef HNDL_ATTN
 #undef HNDL_FAKE

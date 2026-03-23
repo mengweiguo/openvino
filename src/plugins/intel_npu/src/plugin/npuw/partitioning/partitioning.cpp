@@ -774,10 +774,15 @@ void Partitioner::identifySubgraphs() {
                     }
                 }
             }  // for (outputs)
+            const auto new_results_size = group.sg._results.size();
             if (num_optimized_out == output_layer_ptr->outputs().size()) {
                 num_optimized_out_layers++;
+            } else if (new_results_size == old_results_size) {
+                // Multi-output layers (e.g. Split) may have some ports internal
+                // and the remaining boundary ports all optimized away — still no
+                // Results were added, so count the layer as optimized out.
+                num_optimized_out_layers++;
             }
-            const auto new_results_size = group.sg._results.size();
             LOG_VERB("Note: Processing the group " << this_group_idx << " output layer " << output_layer_name
                                                    << " added " << new_results_size - old_results_size
                                                    << " new Result node(s)");

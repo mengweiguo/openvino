@@ -140,6 +140,9 @@ class Compiler {
         for (const auto& isol : ou::getIsolates(ou::ISOL_PRESETS.at("FAKE"))) {
             isolates.push_back(isol);
         }
+        for (const auto& isol : ou::getIsolates(ou::ISOL_PRESETS.at("SSM"))) {
+            isolates.push_back(isol);
+        }
         return isolates;
     }
 
