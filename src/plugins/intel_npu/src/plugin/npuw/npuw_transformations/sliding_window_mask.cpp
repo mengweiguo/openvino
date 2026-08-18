@@ -181,101 +181,6 @@ bool patch_gemma4_token_type_pad(const std::shared_ptr<ov::Model>& model) {
     return changed;
 }
 
-// Gemma 4 emits the local-attention mask as
-//
-//   Select(Unsqueeze(GreaterEqual(row_pos - col_pos, window)), -inf, causal_mask)
-//
-// The static chunk-prefill graph right-aligns the current chunk in the physical
-// KV buffer. Rebuild only this condition using logical positions. The
-// attention mask is also the authoritative mapping from physical KV slots to
-// logical token positions: cumsum(mask)-1.
-bool patch_gemma4_select_local_mask(const std::shared_ptr<ov::Model>& model,
-                                    const std::shared_ptr<ov::Node>& attention_mask,
-                                    const std::shared_ptr<ov::Node>& position_ids) {
-    auto axis_query = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 2);
-    auto axis_one = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 1);
-
-    bool changed = false;
-    for (const auto& node : model->get_ordered_ops()) {
-        auto select = ov::as_type_ptr<ov::op::v1::Select>(node);
-        if (!select) {
-            continue;
-        }
-
-        // The exported graph may contain one or two Unsqueeze nodes between
-        // GreaterEqual and Select, depending on whether the graph was already
-        // rank-normalized before this pass runs.
-        auto condition_source = select->input_value(0).get_node_shared_ptr();
-        while (ov::as_type_ptr<ov::op::v0::Unsqueeze>(condition_source)) {
-            auto unsqueeze = ov::as_type_ptr<ov::op::v0::Unsqueeze>(condition_source);
-            condition_source = unsqueeze->input_value(0).get_node_shared_ptr();
-        }
-        auto greater_equal = ov::as_type_ptr<ov::op::v1::GreaterEqual>(condition_source);
-        if (!greater_equal) {
-            continue;
-        }
-        auto window = ov::as_type_ptr<ov::op::v0::Constant>(greater_equal->input_value(1).get_node_shared_ptr());
-        if (!window || window->get_output_size() != 1) {
-            continue;
-        }
-
-        // Keep the original window value and precision-independent i64
-        // arithmetic. q: [1, chunk, 1], k: [1, 1, kv_capacity].
-        const auto window_value = window->cast_vector<int64_t>().front();
-        auto window_i64 = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, window_value);
-        auto mask_i64 = attention_mask;
-        if (attention_mask->get_output_element_type(0) != ov::element::i64) {
-            mask_i64 = std::make_shared<ov::op::v0::Convert>(attention_mask, ov::element::i64);
-        }
-        auto zero_i64 = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
-        std::shared_ptr<ov::Node> key_logical = std::make_shared<ov::op::v0::CumSum>(mask_i64, axis_one);
-        auto one_i64 = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 1);
-        key_logical = std::make_shared<ov::op::v1::Subtract>(key_logical, one_i64);
-        auto query_logical = std::make_shared<ov::op::v0::Unsqueeze>(position_ids, axis_query);
-        auto key_logical_row = std::make_shared<ov::op::v0::Unsqueeze>(key_logical, axis_one);
-        auto logical_distance = std::make_shared<ov::op::v1::Subtract>(query_logical, key_logical_row);
-        auto logical_beyond_window = std::make_shared<ov::op::v1::GreaterEqual>(logical_distance, window_i64);
-        auto logical_condition = std::make_shared<ov::op::v0::Unsqueeze>(logical_beyond_window, axis_one);
-
-        select->input(0).replace_source_output(logical_condition);
-
-        // The false branch of this Select contains Gemma4's causal mask.  Its
-        // exported triu uses the physical static query range, which is wrong
-        // when a short chunk is right-aligned (the real query at logical 0 is
-        // physically at 747 for a 277-token chunk).  Replace only that triu
-        // predicate and retain the sibling multimodal blockwise mask.
-        auto false_branch = select->input_value(2).get_node_shared_ptr();
-        if (auto broadcast = ov::as_type_ptr<ov::op::v3::Broadcast>(false_branch)) {
-            false_branch = broadcast->input_value(0).get_node_shared_ptr();
-        }
-        auto causal_add = ov::as_type_ptr<ov::op::v1::Add>(false_branch);
-        if (causal_add) {
-            auto causal_mask = causal_add->input_value(0).get_node_shared_ptr();
-            while (ov::as_type_ptr<ov::op::v0::Unsqueeze>(causal_mask)) {
-                causal_mask = ov::as_type_ptr<ov::op::v0::Unsqueeze>(causal_mask)
-                                   ->input_value(0)
-                                   .get_node_shared_ptr();
-            }
-            if (auto triu_select = ov::as_type_ptr<ov::op::v1::Select>(causal_mask)) {
-                auto query_logical_3d = std::make_shared<ov::op::v0::Unsqueeze>(position_ids, axis_query);
-                auto key_logical_3d = std::make_shared<ov::op::v0::Unsqueeze>(key_logical, axis_one);
-                auto key_after_query = std::make_shared<ov::op::v1::Greater>(key_logical_3d, query_logical_3d);
-                auto invalid_key = std::make_shared<ov::op::v1::Equal>(mask_i64, zero_i64);
-                auto invalid_key_3d = std::make_shared<ov::op::v0::Unsqueeze>(invalid_key, axis_one);
-                auto invalid_causal = std::make_shared<ov::op::v1::LogicalOr>(key_after_query, invalid_key_3d);
-                auto axis_batch = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, 0);
-                auto invalid_causal_2d = std::make_shared<ov::op::v0::Squeeze>(invalid_causal, axis_batch);
-                triu_select->input(0).replace_source_output(invalid_causal_2d);
-            }
-        }
-        changed = true;
-    }
-    if (changed) {
-    }
-
-    return changed;
-}
-
 class OldPhi3SlidingMaskMatcher : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::patterns::OldPhi3SlidingMaskMatcher");
@@ -815,9 +720,7 @@ bool SlidingWindowMask::run_on_model(const std::shared_ptr<ov::Model>& model) {
     rewriter->add_matcher<OldPhi3SlidingMaskMatcher>();
     const auto changed = manager.run_passes(model);
     const auto gemma4_token_type_pad_changed = patch_gemma4_token_type_pad(model);
-    const auto gemma4_local_mask_changed =
-        patch_gemma4_select_local_mask(model, attention_mask_node_ptr, position_ids_node_ptr);
-    return changed || gemma4_token_type_pad_changed || gemma4_local_mask_changed;
+    return changed || gemma4_token_type_pad_changed;
 }
 
 }  // namespace ov::npuw
