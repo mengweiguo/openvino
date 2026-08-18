@@ -147,7 +147,26 @@ static HFATileF32Nodes convert_inputs_to_f32(const HFATileInputs& inputs,
     f32_nodes.past_acc_f32 = std::make_shared<ov::op::v0::Convert>(inputs.past_acc, compute_dtype);
     f32_nodes.past_acc_f32->set_friendly_name("past_acc_f32");
 
-    f32_nodes.past_max_f32 = std::make_shared<ov::op::v0::Convert>(inputs.past_max, compute_dtype);
+    auto past_max_converted = std::make_shared<ov::op::v0::Convert>(inputs.past_max, compute_dtype);
+    // f16 HFA state uses the lowest finite value as the empty-row sentinel.
+    // Interpret it as -inf only while evaluating the online softmax: otherwise
+    // a masked score around -65504 can become the row maximum and contribute to
+    // the next tile.  Keeping the stored sentinel finite avoids an f16-infinity
+    // performance regression in the tile kernels.
+    if (inputs.past_max->get_output_element_type(0) == ov::element::f16) {
+        const auto sentinel = std::make_shared<ov::op::v0::Constant>(
+            ov::element::f16,
+            ov::Shape{},
+            std::vector<ov::float16>{std::numeric_limits<ov::float16>::lowest()});
+        const auto is_empty = std::make_shared<ov::op::v1::Equal>(inputs.past_max, sentinel);
+        const auto neg_inf =
+            std::make_shared<ov::op::v0::Constant>(compute_dtype,
+                                                   ov::Shape{},
+                                                   std::vector<float>{-std::numeric_limits<float>::infinity()});
+        f32_nodes.past_max_f32 = std::make_shared<ov::op::v1::Select>(is_empty, neg_inf, past_max_converted);
+    } else {
+        f32_nodes.past_max_f32 = past_max_converted;
+    }
     f32_nodes.past_max_f32->set_friendly_name("past_max_f32");
 
     f32_nodes.past_d_f32 = std::make_shared<ov::op::v0::Convert>(inputs.past_d, compute_dtype);
@@ -769,12 +788,19 @@ static std::shared_ptr<ov::Model> create_hfa_tile_model(const ov::Shape& q_shape
 }
 
 // ============================================================================
-// Helper function: Extract actual Parameter by skipping Convert nodes
+// Helper function: Extract the external Parameter behind the shape/layout
+// nodes used to prepare Q/K/V inputs for SDPA.  In Gemma4 the query reaches
+// MatMul through a Transpose (and, depending on the frontend, Reshape/Convert),
+// so looking only through Convert silently leaves query_param_idx at its
+// default value and binds a past-K block as Q at runtime.
 // ============================================================================
 static std::shared_ptr<ov::Node> skip_convert_nodes(const std::shared_ptr<ov::Node>& node) {
     auto current = node;
-    while (current && ov::is_type<ov::op::v0::Convert>(current.get())) {
-        if (current->get_input_size() > 0) {
+    while (current && !ov::op::util::is_parameter(current)) {
+        // Only follow unary nodes.  Following an arbitrary input of a
+        // multi-input operation could bind an unrelated branch as a cache/Q
+        // input and is less safe than rejecting the pattern.
+        if (current->get_input_size() == 1) {
             current = current->get_input_node_shared_ptr(0);
         } else {
             break;
@@ -797,8 +823,13 @@ static void build_sdpa_param_mapping(HostFlashAttention& hfa,
     };
 
     // Extract Q (query) parameter - input 0 of MatMul1
-    if (auto q_param = extract_param(pattern_nodes.matmul1_node->get_input_node_shared_ptr(0))) {
+    const auto q_source = pattern_nodes.matmul1_node->get_input_node_shared_ptr(0);
+    if (auto q_param = extract_param(q_source)) {
         hfa._query_param_idx = model->get_parameter_index(q_param);
+    } else {
+        OPENVINO_THROW("HFA: Could not resolve SDPA query input to a model parameter (source='",
+                       q_source ? q_source->get_friendly_name() : "<null>",
+                       "')");
     }
 
     // Extract past KV parameters from a Concat node: all inputs except the last are treated as
@@ -1101,8 +1132,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // Regular tile: state and KV-tile both use block_kv_dtype (f16).
     //   past_acc/max/d: f16   k_tile/v_tile: f16  (from KV blocks)
     // Final tile: state still uses block_kv_dtype (f16) for zero-copy with regular
-    //   tile outputs; KV-tile uses present_kv_dtype (f32) matching the upstream graph.
-    //   past_acc/max/d: f16   k_tile/v_tile: f32  (present-KV from upstream)
+    // tile outputs; KV-tile uses present_kv_dtype (f32) matching the upstream graph.
     LOG_INFO("Creating HFA tile models: tile_size=" << query_size << ", v_transposed=" << v_transposed
                                                     << ", block_kv=" << block_kv_dtype
                                                     << ", present_kv=" << present_kv_dtype << ", q=" << q_dtype);

@@ -145,6 +145,42 @@ bool is_zero_scalar_constant(const ov::Output<ov::Node>& output) {
     return !values.empty() && values.front() == 0;
 }
 
+// Chunk-prefill uses a [1, chunk] token_type_ids input while the Gemma4
+// multimodal mask is built in the full [1, max_prompt] window.  The exported
+// graph right-pads this input, but runtime chunk inputs are right-aligned in
+// the full window.  Move the Pad's source to the full-window tail so the
+// blockwise vision mask and Q/K/V use the same physical positions.
+bool patch_gemma4_token_type_pad(const std::shared_ptr<ov::Model>& model) {
+    bool changed = false;
+    for (const auto& node : model->get_ordered_ops()) {
+        auto pad = ov::as_type_ptr<ov::op::v12::Pad>(node);
+        if (!pad || pad->input_value(0).get_node()->get_friendly_name() != "token_type_ids") {
+            continue;
+        }
+
+        const auto input_shape = pad->input_value(0).get_partial_shape();
+        const auto output_shape = pad->output(0).get_partial_shape();
+        if (input_shape.rank().is_dynamic() || output_shape.rank().is_dynamic() || input_shape.size() != 2u ||
+            output_shape.size() != 2u || !input_shape[1].is_static() || !output_shape[1].is_static() ||
+            input_shape[1].get_length() >= output_shape[1].get_length()) {
+            continue;
+        }
+
+        const auto shift = static_cast<int64_t>(output_shape[1].get_length() - input_shape[1].get_length());
+        auto pads_begin = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{0, shift});
+        auto pads_end = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{0, 0});
+        auto replacement = std::make_shared<ov::op::v12::Pad>(pad->input_value(0),
+                                                              pads_begin,
+                                                              pads_end,
+                                                              pad->input_value(3),
+                                                              pad->get_pad_mode());
+        replacement->set_friendly_name(pad->get_friendly_name() + "/chunk_right_align");
+        pad->output(0).replace(replacement->output(0));
+        changed = true;
+    }
+    return changed;
+}
+
 class OldPhi3SlidingMaskMatcher : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::patterns::OldPhi3SlidingMaskMatcher");
@@ -682,7 +718,9 @@ bool SlidingWindowMask::run_on_model(const std::shared_ptr<ov::Model>& model) {
     rewriter->add_matcher<Gemma4UnifiedSlidingMaskMatcher>(attention_mask_node_ptr, position_ids_node_ptr);
     rewriter->add_matcher<Phi3SlidingMaskMatcher>(attention_mask_node_ptr, position_ids_node_ptr);
     rewriter->add_matcher<OldPhi3SlidingMaskMatcher>();
-    return manager.run_passes(model);
+    const auto changed = manager.run_passes(model);
+    const auto gemma4_token_type_pad_changed = patch_gemma4_token_type_pad(model);
+    return changed || gemma4_token_type_pad_changed;
 }
 
 }  // namespace ov::npuw

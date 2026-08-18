@@ -468,12 +468,24 @@ std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::LLMInferRequest::select_genera
     int64_t expected_total_tokens = prompt_length + min_response_len;
 
     const auto& kvcache_sizes = m_npuw_llm_compiled_model->m_kvcache_sizes;
+    // A generate variant reserves max_generation_token_len positions for the
+    // current generate input.  Its usable past-KV capacity is therefore
+    // kv_size - max_generation_token_len, rather than kv_size itself.  The
+    // previous comparison against kv_size could select the 1152-token variant
+    // for a 277-token prompt, although that variant had only 128 past slots;
+    // generate then masked out most of the prefilled KV cache.
+    const uint32_t max_generation_len = kvcache_desc.max_generation_token_len;
     // Find the smallest variant that can accommodate the expected token count
+    // in its usable past-KV capacity.
     for (size_t i = 0; i < kvcache_sizes.size(); ++i) {
-        if (expected_total_tokens <= kvcache_sizes[i]) {
+        OPENVINO_ASSERT(kvcache_sizes[i] >= max_generation_len,
+                        "Generate KV variant size must be at least max_generation_token_len.");
+        const uint32_t past_capacity = kvcache_sizes[i] - max_generation_len;
+        if (expected_total_tokens <= past_capacity) {
             LOG_DEBUG("Selected generate request " << (i + 1) << "/" << kvcache_sizes.size() << " with size "
                                                    << kvcache_sizes[i] << " for prompt_length=" << prompt_length
-                                                   << " (expected_total=" << expected_total_tokens << " tokens)");
+                                                   << " (expected_total=" << expected_total_tokens
+                                                   << ", past_capacity=" << past_capacity << " tokens)");
             return m_generate_requests[i];
         }
     }
@@ -635,7 +647,6 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
         const auto& pre_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_pre);
         const auto& gen_kv_dim = kv_dim(kvcache_desc.v_tensors_transposed_gen);
 
-        const auto prefill_chunk_size = m_npuw_llm_compiled_model->m_prefill_chunk_size;
         const bool use_chunk_prefill = m_npuw_llm_compiled_model->m_use_chunk_prefill;
         if (use_chunk_prefill) {
             // The chunk prefilled KV results are divided into two parts:
@@ -678,11 +689,22 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
             }
 
             // Copy part 2 KV results
+            // The prefill graph places the current chunk at the tail of the
+            // KV output.  Use the actual output extent rather than
+            // max_prompt_size: HFA and non-block variants may expose a
+            // reduced KV output shape, and using the configured maximum here
+            // can create an out-of-range tensor view.
+            const auto prefill_output_seq_len = prefill_out_tensor->get_shape()[pre_kv_dim];
+            OPENVINO_ASSERT(prefill_output_seq_len >= m_tokens_in_present_chunk,
+                            "Prefill KV output is shorter than the current chunk: output_seq_len=",
+                            prefill_output_seq_len,
+                            ", current_chunk=",
+                            m_tokens_in_present_chunk);
             auto prefill_present_kv_chunk =
                 uu::make_tensor_slice(prefill_out_tensor,
                                       pre_kv_dim,
-                                      static_cast<uint32_t>(prefill_chunk_size - m_tokens_in_present_chunk),
-                                      static_cast<uint32_t>(prefill_chunk_size));
+                                      static_cast<uint32_t>(prefill_output_seq_len - m_tokens_in_present_chunk),
+                                      static_cast<uint32_t>(prefill_output_seq_len));
 
             auto kvcache_last_kv_chunk = uu::make_tensor_slice(kvcache_in_tensor,
                                                                gen_kv_dim,
@@ -691,11 +713,16 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
 
             uu::copy_tensor_by_dim(prefill_present_kv_chunk, kvcache_last_kv_chunk, pre_kv_dim, gen_kv_dim);
         } else {
-            auto prefill_out_slice =
-                uu::make_tensor_slice(prefill_out_tensor,
-                                      pre_kv_dim,
-                                      kvcache_desc.max_prompt_size - kvcache_desc.num_stored_tokens,
-                                      kvcache_desc.max_prompt_size);
+            const auto prefill_output_seq_len = prefill_out_tensor->get_shape()[pre_kv_dim];
+            OPENVINO_ASSERT(prefill_output_seq_len >= kvcache_desc.num_stored_tokens,
+                            "Prefill KV output is shorter than stored tokens: output_seq_len=",
+                            prefill_output_seq_len,
+                            ", stored_tokens=",
+                            kvcache_desc.num_stored_tokens);
+            auto prefill_out_slice = uu::make_tensor_slice(prefill_out_tensor,
+                                                           pre_kv_dim,
+                                                           prefill_output_seq_len - kvcache_desc.num_stored_tokens,
+                                                           prefill_output_seq_len);
 
             auto kvcache_in_slice =
                 uu::make_tensor_slice(kvcache_in_tensor, gen_kv_dim, 0u, kvcache_desc.num_stored_tokens);
@@ -948,9 +975,13 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
             size_t last_chunk_offset = attn_mask_in_tensor->get_size() - chunk_prompt_len;
             if (current_prompts_len < chunk_prompt_len) {
                 // We will populate current_prompts_len on the right side of attention mask for the processing tokens
-                // If the current prompt length is smaller than the chunk prompt length,
-                // clear the last chunk of the attention mask to ensure non-relevant tokens are masked
-                ov::npuw::util::fill_tensor<int64_t>(attn_mask_in_tensor, 0, last_chunk_offset);
+                // Clear the physical window used by the current chunk before placing
+                // its valid tokens at the tail.  The prefix contains the KV history
+                // from earlier chunks and must remain intact.  Clearing the first
+                // `last_chunk_offset` elements here drops that history for a short
+                // final chunk (for example, 1024 + 277), causing decode to attend
+                // only to the final chunk.
+                std::fill_n(attn_mask_in_tensor->data<int64_t>() + last_chunk_offset, chunk_prompt_len, int64_t{0});
             }
 
             std::copy_n(attention_mask->data<int64_t>() + kvcache_desc.num_stored_tokens,
@@ -985,6 +1016,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                                                   static_cast<uint32_t>(last_dim),
                                                   static_cast<uint32_t>(chunk_prompt_len - current_prompts_len),
                                                   static_cast<uint32_t>(chunk_prompt_len));
+
+            // A short chunk is right-aligned in the static window.  Clear the
+            // padding positions before copying the real position IDs; unlike
+            // the whole-prefill path, this request tensor is reused between
+            // chunks/conversations and its prefix may contain old positions.
+            ov::npuw::util::fill_tensor<int64_t>(pos_ids_in_tensor, 0);
 
             // Copy with proper stride handling
             actual_position_ids_slice->copy_to(pos_ids_slice._ptr);
@@ -1069,6 +1106,12 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
 
         const bool is_last_chunk = (remaining_prompts - current_prompts_len) <= 0;
         remaining_prompts -= current_prompts_len;
+        // Update the logical cache length before finalizing the chunk.  The block
+        // KV strategy uses the post-chunk value to calculate the write origin:
+        //   write_start = num_stored_tokens - current_prompts_len.
+        // Keeping the increment after on_prefill_chunk_done() makes a short final
+        // chunk overwrite the tail of the preceding block (e.g. 747 instead of
+        // 1024 after a 1024 + 277 prefill).
         kvcache_desc.num_stored_tokens += static_cast<uint32_t>(current_prompts_len);
 
         m_llm_profile["1/prefill:3d.update_kvcache"].record([&]() {

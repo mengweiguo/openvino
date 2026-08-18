@@ -221,6 +221,35 @@ public:
     }
 };
 
+// Gemma4 VLM exports the local mask as a float masked-fill operation:
+//
+//   Select(Unsqueeze(Unsqueeze(GreaterEqual(query - key, window))), -inf, causal_mask)
+//
+// Detect it before the causal-mask matchers inspect the causal_mask branch.
+// Otherwise HFA classifies the model as purely causal and skips the mask on
+// regular tiles, which is invalid for local-attention layers.
+class Gemma4SelectSlidingMatcher final : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("ov::npuw::Gemma4SelectSlidingMatcher");
+    explicit Gemma4SelectSlidingMatcher(ov::npuw::MaskInfo& mask_info) {
+        auto window_constant = opp::wrap_type<ov::op::v0::Constant>();
+        auto greater_equal =
+            opp::wrap_type<ov::op::v1::GreaterEqual>({opp::wrap_type<ov::op::v1::Subtract>(), window_constant});
+        auto unsqueeze_1 = opp::wrap_type<ov::op::v0::Unsqueeze>({greater_equal, opp::any_input()});
+        auto unsqueeze_2 = opp::wrap_type<ov::op::v0::Unsqueeze>({unsqueeze_1, opp::any_input()});
+        auto select = opp::wrap_type<ov::op::v1::Select>({unsqueeze_2, opp::any_input(), opp::any_input()});
+        auto callback = [=, &mask_info](opp::Matcher& m) {
+            const int64_t window_size =
+                get_window_size(m.get_pattern_value_map().at(window_constant).get_node_shared_ptr());
+            if (window_size > 0) {
+                mask_info = {ov::npuw::MaskInfo::MaskType::SlidingWindow, window_size};
+            }
+            return false;
+        };
+        register_matcher(std::make_shared<opp::Matcher>(select, "DetectGemma4SelectSliding"), callback);
+    }
+};
+
 #ifdef __GNUC__
 #    pragma GCC diagnostic pop
 #endif
@@ -236,6 +265,7 @@ bool DetectAttentionMask::run_on_model(const std::shared_ptr<ov::Model>& model) 
     detector.add_matcher<BitwiseAndSlidingMatcher>(m_mask_info);
     detector.add_matcher<OldPhi3SlidingMatcher>(m_mask_info);
     detector.add_matcher<DefaultSWAMatcher>(m_mask_info);
+    detector.add_matcher<Gemma4SelectSlidingMatcher>(m_mask_info);
     detector.add_matcher<SDPACausalMatcher>(m_mask_info);
     detector.add_matcher<StandardCausalMatcher>(m_mask_info);
     detector.add_matcher<Qwen3CausalMatcher>(m_mask_info);
