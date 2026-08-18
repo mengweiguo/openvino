@@ -420,6 +420,16 @@ void LLMBlockKVCacheStrategy::on_generate_kv_init() {
                               const BlockBindingHelper& helper,
                               uint32_t kv_dim,
                               const char* kv_type_name) {
+        // A generate variant may contain a short block_tail after its full
+        // numbered blocks (for example, 127 tokens in the 1152-token
+        // variant).  The first prompt often occupies only block_0, so that
+        // tail is not refreshed by copy_block_to_tail_input().  Clear it for
+        // every variant before binding; clearing only the largest variant is
+        // insufficient because pyramid selection starts with a smaller one.
+        if (helper.tail_input_port.has_value()) {
+            auto tail_tensor = m_req.m_kvcache_request->get_tensor(helper.tail_input_port.value());
+            util::fill_tensor_bytes(tail_tensor, 0u);
+        }
         auto allocated_blocks = manager->get_allocated_blocks();
         if (allocated_blocks.empty()) {
             return;

@@ -74,6 +74,12 @@ std::optional<uint32_t> KVCacheBlockManager::allocate_block() {
                                                                      << ", device=" << device_ << ")");
     }
 
+    // A block may be only partially populated (for example, the first block
+    // of a 277-token prompt). The model still receives the complete fixed-size
+    // tensor, so clear unused positions before copying valid KV into it. This
+    // also prevents stale data when a warm block is reused for a new prompt.
+    ov::npuw::util::fill_tensor_bytes(block.tensor, 0u);
+
     // Reset block state
     block.num_tokens = 0;
     block.is_allocated = true;

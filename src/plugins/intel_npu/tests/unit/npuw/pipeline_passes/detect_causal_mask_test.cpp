@@ -378,6 +378,56 @@ TEST(DetectAttentionMaskTest, RealPattern_Phi3Sliding_IsSlidingWindowWithSize) {
     EXPECT_EQ(info.window_size, window);
 }
 
+TEST(DetectAttentionMaskTest, Gemma4SelectSliding_IsSlidingWindowWithSize) {
+    using namespace ov::op;
+    constexpr int64_t window = 1024;
+    auto query = std::make_shared<v0::Parameter>(ov::element::i64, ov::Shape{8, 1});
+    auto key = std::make_shared<v0::Parameter>(ov::element::i64, ov::Shape{1, 16});
+    auto bound = v0::Constant::create(ov::element::i64, ov::Shape{}, {window});
+    auto condition = std::make_shared<v1::GreaterEqual>(std::make_shared<v1::Subtract>(query, key), bound);
+    auto zero = v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    auto condition_3d = std::make_shared<v0::Unsqueeze>(condition, zero);
+    auto condition_4d = std::make_shared<v0::Unsqueeze>(condition_3d, zero);
+    auto neg_inf = v0::Constant::create(ov::element::f32, ov::Shape{}, {-10000.0f});
+    auto causal_mask = v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 8, 16}, {0.0f});
+    auto mask = std::make_shared<v1::Select>(condition_4d, neg_inf, causal_mask);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{mask}, ov::ParameterVector{query, key});
+
+    DetectAttentionMask pass;
+    pass.run_on_model(model);
+    const auto& info = pass.get_mask_info();
+    EXPECT_EQ(info.mask_type, MaskInfo::MaskType::SlidingWindow);
+    EXPECT_EQ(info.window_size, window);
+}
+
+TEST(DetectAttentionMaskTest, Gemma4SelectSliding_TakesPrecedenceOverGlobalCausalAttention) {
+    using namespace ov::op;
+    constexpr int64_t window = 1024;
+    auto query = std::make_shared<v0::Parameter>(ov::element::i64, ov::Shape{8, 1});
+    auto key = std::make_shared<v0::Parameter>(ov::element::i64, ov::Shape{1, 16});
+    auto bound = v0::Constant::create(ov::element::i64, ov::Shape{1, 1}, {window});
+    auto condition = std::make_shared<v1::GreaterEqual>(std::make_shared<v1::Subtract>(query, key), bound);
+    auto zero = v0::Constant::create(ov::element::i64, ov::Shape{}, {0});
+    auto condition_3d = std::make_shared<v0::Unsqueeze>(condition, zero);
+    auto condition_4d = std::make_shared<v0::Unsqueeze>(condition_3d, zero);
+    auto neg_inf = v0::Constant::create(ov::element::f32, ov::Shape{}, {-10000.0f});
+    auto causal_mask = v0::Constant::create(ov::element::f32, ov::Shape{1, 1, 8, 16}, {0.0f});
+    auto local_mask = std::make_shared<v1::Select>(condition_4d, neg_inf, causal_mask);
+
+    auto q = std::make_shared<v0::Parameter>(ov::element::f32, ov::Shape{1, 4, 8, 64});
+    auto k = std::make_shared<v0::Parameter>(ov::element::f32, ov::Shape{1, 4, 8, 64});
+    auto v = std::make_shared<v0::Parameter>(ov::element::f32, ov::Shape{1, 4, 8, 64});
+    auto global_attention = std::make_shared<v13::ScaledDotProductAttention>(q, k, v, true);
+    auto model = std::make_shared<ov::Model>(ov::OutputVector{local_mask, global_attention},
+                                             ov::ParameterVector{query, key, q, k, v});
+
+    DetectAttentionMask pass;
+    pass.run_on_model(model);
+    const auto& info = pass.get_mask_info();
+    EXPECT_EQ(info.mask_type, MaskInfo::MaskType::SlidingWindow);
+    EXPECT_EQ(info.window_size, window);
+}
+
 // ============================================================================
 // Unknown / unmasked — must report MaskType::Unknown
 // ============================================================================

@@ -915,7 +915,17 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
 
                         ov::SoPtr<ov::ITensor> state_acc, state_max, state_sum;
                         if (state.hfa_runtime_ctx && state.hfa_runtime_ctx->has_state_buffers()) {
-                            const auto& current_buffer = state.hfa_runtime_ctx->get_current_state_buffers();
+                            // HFA's online-softmax state is valid only for the current
+                            // attention invocation.  RuntimeState and the double buffers
+                            // are intentionally kept across calls, so a new prefill chunk
+                            // (or a new decode step) must reset the active buffer before
+                            // accumulating its KV tiles.  Without this, chunk N starts with
+                            // the accumulators from chunk N-1 and produces incorrect logits.
+                            auto& current_buffer = state.hfa_runtime_ctx->get_current_state_buffers();
+                            runtime::host_flash_attention::HFARuntimeContext::initialize_state_tensors(
+                                current_buffer.acc,
+                                current_buffer.max,
+                                current_buffer.sum);
                             state_acc = current_buffer.acc;
                             state_max = current_buffer.max;
                             state_sum = current_buffer.sum;

@@ -959,6 +959,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                   0,
                                   true)
             .run_on_model(prefill_model);
+        // The chunk graph has a smaller token_type_ids input than the full
+        // attention window.  Apply the Gemma4 multimodal alignment fix after
+        // static reshaping, when both dimensions are known.
+        ov::npuw::PatchSlidingWindowMask().run_on_model(prefill_model);
     } else {
         ov::npuw::ReshapeToStatic(m_kvcache_desc.max_prompt_size,
                                   m_kvcache_desc.max_prompt_size,
@@ -1082,10 +1086,16 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
 
     if (prefill_attn_hfa) {
+        // Gemma-family VLMs retain token_type_ids in prefill to build the multimodal
+        // blockwise mask. That mask is not purely causal, even if a generic causal
+        // matcher finds one of its branches. HFA regular tiles must consume it.
+        const bool has_multimodal_blockwise_mask =
+            ov::npuw::util::has_input(kvcache_model, ov::npuw::util::kTokenTypeIdsParamName);
         prefill_config[ov::intel_npu::npuw::partitioning::attn_hfa_mask_skipping.name()] =
-            mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal ||
-                    (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow &&
-                     mask_info.window_size >= max_prompt_len)
+            !has_multimodal_blockwise_mask &&
+                    (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal ||
+                     (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow &&
+                      mask_info.window_size >= max_prompt_len))
                 ? "YES"
                 : "NO";
     }
