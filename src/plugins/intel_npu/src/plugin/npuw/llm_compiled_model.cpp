@@ -1092,10 +1092,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         const bool has_multimodal_blockwise_mask =
             ov::npuw::util::has_input(kvcache_model, ov::npuw::util::kTokenTypeIdsParamName);
         prefill_config[ov::intel_npu::npuw::partitioning::attn_hfa_mask_skipping.name()] =
-            !has_multimodal_blockwise_mask &&
-                    (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal ||
-                     (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow &&
-                      mask_info.window_size >= max_prompt_len))
+            !has_multimodal_blockwise_mask && (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::Causal ||
+                                               (mask_info.mask_type == ov::npuw::MaskInfo::MaskType::SlidingWindow &&
+                                                mask_info.window_size >= max_prompt_len))
                 ? "YES"
                 : "NO";
     }

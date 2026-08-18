@@ -170,10 +170,10 @@ bool patch_gemma4_token_type_pad(const std::shared_ptr<ov::Model>& model) {
         auto pads_begin = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{0, shift});
         auto pads_end = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, std::vector<int64_t>{0, 0});
         auto replacement = std::make_shared<ov::op::v12::Pad>(pad->input_value(0),
-                                                               pads_begin,
-                                                               pads_end,
-                                                               pad->input_value(3),
-                                                               pad->get_pad_mode());
+                                                              pads_begin,
+                                                              pads_end,
+                                                              pad->input_value(3),
+                                                              pad->get_pad_mode());
         replacement->set_friendly_name(pad->get_friendly_name() + "/chunk_right_align");
         pad->output(0).replace(replacement->output(0));
         changed = true;

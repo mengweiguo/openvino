@@ -492,8 +492,7 @@ std::shared_ptr<ov::IAsyncInferRequest> ov::npuw::LLMInferRequest::select_genera
 
     // Fallback to the largest variant if expected_total_tokens exceeds all predefined sizes
     LOG_WARN("No suitable generate request found for expected_total_tokens="
-             << expected_total_tokens << " (prompt_length=" << prompt_length
-             << "), using largest variant");
+             << expected_total_tokens << " (prompt_length=" << prompt_length << "), using largest variant");
     return m_generate_requests.back();
 }
 
@@ -720,18 +719,16 @@ void ov::npuw::LLMInferRequest::copy_kvcache() {
                             prefill_output_seq_len,
                             ", stored_tokens=",
                             kvcache_desc.num_stored_tokens);
-            auto prefill_out_slice =
-                uu::make_tensor_slice(prefill_out_tensor,
-                                      pre_kv_dim,
-                                      prefill_output_seq_len - kvcache_desc.num_stored_tokens,
-                                      prefill_output_seq_len);
+            auto prefill_out_slice = uu::make_tensor_slice(prefill_out_tensor,
+                                                           pre_kv_dim,
+                                                           prefill_output_seq_len - kvcache_desc.num_stored_tokens,
+                                                           prefill_output_seq_len);
 
             auto kvcache_in_slice =
                 uu::make_tensor_slice(kvcache_in_tensor, gen_kv_dim, 0u, kvcache_desc.num_stored_tokens);
 
             uu::copy_tensor_by_dim(prefill_out_slice, kvcache_in_slice, pre_kv_dim, gen_kv_dim);
         }
-
     });
     LOG_DEBUG("Done.");
 }
@@ -984,9 +981,7 @@ void ov::npuw::LLMInferRequest::infer_chunked_prefill(ov::SoPtr<ov::ITensor> inp
                 // `last_chunk_offset` elements here drops that history for a short
                 // final chunk (for example, 1024 + 277), causing decode to attend
                 // only to the final chunk.
-                std::fill_n(attn_mask_in_tensor->data<int64_t>() + last_chunk_offset,
-                            chunk_prompt_len,
-                            int64_t{0});
+                std::fill_n(attn_mask_in_tensor->data<int64_t>() + last_chunk_offset, chunk_prompt_len, int64_t{0});
             }
 
             std::copy_n(attention_mask->data<int64_t>() + kvcache_desc.num_stored_tokens,

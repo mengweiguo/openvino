@@ -159,10 +159,10 @@ static HFATileF32Nodes convert_inputs_to_f32(const HFATileInputs& inputs,
             ov::Shape{},
             std::vector<ov::float16>{std::numeric_limits<ov::float16>::lowest()});
         const auto is_empty = std::make_shared<ov::op::v1::Equal>(inputs.past_max, sentinel);
-        const auto neg_inf = std::make_shared<ov::op::v0::Constant>(
-            compute_dtype,
-            ov::Shape{},
-            std::vector<float>{-std::numeric_limits<float>::infinity()});
+        const auto neg_inf =
+            std::make_shared<ov::op::v0::Constant>(compute_dtype,
+                                                   ov::Shape{},
+                                                   std::vector<float>{-std::numeric_limits<float>::infinity()});
         f32_nodes.past_max_f32 = std::make_shared<ov::op::v1::Select>(is_empty, neg_inf, past_max_converted);
     } else {
         f32_nodes.past_max_f32 = past_max_converted;
@@ -1129,17 +1129,15 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     // V tensors are pre-transposed (stored as [B,H,head_dim,seq]) only when OptimizeValueTensors
     // succeeded, which is reflected by the V-concat axis being 3 instead of the default 2.
     const bool v_transposed = (v_seq_dim == 3);
-    // Keep HFA state in the KV storage type: this preserves the existing tile
-    // interface and avoids a precision-conversion penalty between tiles.
-    const auto state_dtype = block_kv_dtype;
-
-    // Regular tile: state and KV tiles in their storage dtype.
-    // Final tile: the same state type and the current present-KV dtype.
+    // Regular tile: state and KV-tile both use block_kv_dtype (f16).
+    //   past_acc/max/d: f16   k_tile/v_tile: f16  (from KV blocks)
+    // Final tile: state still uses block_kv_dtype (f16) for zero-copy with regular
+    // tile outputs; KV-tile uses present_kv_dtype (f32) matching the upstream graph.
     LOG_INFO("Creating HFA tile models: tile_size=" << query_size << ", v_transposed=" << v_transposed
                                                     << ", block_kv=" << block_kv_dtype
                                                     << ", present_kv=" << present_kv_dtype << ", q=" << q_dtype);
     auto tile_model = create_hfa_tile_model(q_shape_static,
-                                            state_dtype,     // state_dtype
+                                            block_kv_dtype,  // state_dtype
                                             block_kv_dtype,  // kv_tile_dtype (past blocks)
                                             q_dtype,
                                             mask_dtype,
@@ -1155,7 +1153,7 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
     }
 
     auto final_tile_model = create_hfa_tile_model(q_shape_static,
-                                                  state_dtype,       // state_dtype (consistent with regular tile)
+                                                  block_kv_dtype,    // state_dtype (consistent with regular tile)
                                                   present_kv_dtype,  // kv_tile_dtype (present-KV, f32)
                                                   q_dtype,
                                                   mask_dtype,
